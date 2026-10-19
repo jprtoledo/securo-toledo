@@ -16,6 +16,8 @@ os.environ.setdefault("AGENTS_BUILTIN_MCP_URL", "http://test-mcp:8765/mcp")
 # Settings(_secrets_dir=...) tests still exercise secret-file loading.
 os.environ["SECRET_KEY"] = "synthetic-test-signing-key-not-for-production"
 os.environ["CREDENTIALS_DIRECTORY"] = ""
+# Synthetic 32-byte key for the encrypted Pluggy credentials (RFC Phase 1).
+os.environ["CREDENTIALS_ENCRYPTION_KEY"] = "dGVzdC1rZXktdGVzdC1rZXktdGVzdC1rZXktMzJieXQ="
 
 # pgvector's Vector type only compiles on PostgreSQL. Tests use SQLite, so
 # we shim it with JSON before any model module imports it. Production runs
@@ -458,6 +460,16 @@ async def test_connection(session: AsyncSession, test_user: User) -> BankConnect
     await session.commit()
     await session.refresh(conn)
     return conn
+
+
+@pytest_asyncio.fixture
+async def pluggy_credential(session: AsyncSession, clean_db):
+    """One stored Pluggy application, so Pluggy connect flows can resolve it."""
+    from app.services import pluggy_credential_service
+
+    return await pluggy_credential_service.create_credential(
+        session, "Personal", "client-id-personal", "secret-personal"
+    )
 
 
 @pytest_asyncio.fixture

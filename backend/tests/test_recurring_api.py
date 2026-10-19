@@ -9,7 +9,7 @@ async def test_create_recurring_transaction(client, auth_headers, test_categorie
     """Creating a recurring transaction sets next_occurrence to start_date."""
     response = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Netflix",
             "amount": 39.90,
             "currency": "BRL",
@@ -36,7 +36,7 @@ async def test_create_recurring_with_skip_first(client, auth_headers, test_categ
     """skip_first=true advances next_occurrence by one frequency period."""
     response = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Mercadinho",
             "amount": 50.00,
             "currency": "EUR",
@@ -62,7 +62,7 @@ async def test_create_recurring_skip_first_monthly(client, auth_headers, test_ac
     """skip_first with monthly frequency advances by one month."""
     response = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Rent",
             "amount": 1500.00,
             "currency": "BRL",
@@ -84,7 +84,7 @@ async def test_create_recurring_skip_first_quarterly(client, auth_headers, test_
     """Quarterly is accepted by the API and skip_first advances three calendar months."""
     response = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Insurance",
             "amount": 300.00,
             "currency": "BRL",
@@ -123,7 +123,7 @@ async def test_create_recurring_skip_first_new_frequencies(
 ):
     response = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": f"{frequency} regression",
             "amount": 100.00,
             "currency": "BRL",
@@ -148,7 +148,7 @@ async def test_generate_pending_creates_transactions(client, auth_headers, test_
     # Create a recurring that's already past due
     create_resp = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Weekly gym",
             "amount": 30.00,
             "currency": "BRL",
@@ -215,7 +215,7 @@ async def test_generate_no_duplicate_with_skip_first(client, auth_headers, test_
     # Then create the recurring with skip_first=true
     rec_resp = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Internet bill",
             "amount": 99.90,
             "currency": "BRL",
@@ -258,7 +258,7 @@ async def test_list_recurring_transactions(client, auth_headers, test_account):
     for desc in ["Sub A", "Sub B"]:
         await client.post(
             "/api/recurring-transactions",
-            json={
+            json={"auto_generate": True, 
                 "description": desc,
                 "amount": 10.00,
                 "type": "debit",
@@ -281,7 +281,7 @@ async def test_delete_recurring_transaction(client, auth_headers, test_account):
     """Delete removes a recurring transaction."""
     create_resp = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "To delete",
             "amount": 5.00,
             "type": "debit",
@@ -310,7 +310,7 @@ async def test_create_recurring_without_account_rejected(client, auth_headers):
     """Omitting account_id should return a validation error, not a 500 later."""
     response = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "No account",
             "amount": 10.00,
             "type": "debit",
@@ -362,7 +362,7 @@ async def test_weekend_adjustment_create_read_and_update(
 ):
     create_response = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Adjusted rent",
             "amount": 1200,
             "currency": "BRL",
@@ -402,7 +402,7 @@ async def test_invalid_weekend_adjustment_is_rejected(
 ):
     create_response = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Invalid policy",
             "amount": 10,
             "type": "debit",
@@ -417,7 +417,7 @@ async def test_invalid_weekend_adjustment_is_rejected(
 
     valid_response = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Valid policy",
             "amount": 10,
             "type": "debit",
@@ -442,7 +442,7 @@ async def test_weekend_adjustment_update_rejects_null_but_allows_omission(
 ):
     create_response = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Null policy regression",
             "amount": 10,
             "type": "debit",

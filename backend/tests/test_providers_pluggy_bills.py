@@ -117,10 +117,13 @@ async def test_bills_parser_preserves_provider_extras_in_raw_data():
     }
     bill = (await _fetch([raw]))[0]
     assert bill.raw_data == raw
-    # And we explicitly do NOT promote them to BillData fields.
-    assert not hasattr(bill, "finance_charges")
-    assert not hasattr(bill, "payments")
-    assert not hasattr(bill, "allows_installments")
+    # RFC toledo-features §4.3 promotes the bill extras the statement view
+    # needs (AC-2.12); everything else still only lives in raw_data.
+    assert bill.payments == raw["payments"]
+    assert bill.allows_installments is True
+    assert bill.finance_charges_total == Decimal("12.34")
+    assert bill.closing_date is None
+    assert not hasattr(bill, "some_future_field")
 
 
 # ---- Required-field handling: skip rather than crash ----------------------

@@ -45,6 +45,7 @@ Non-mutual pairs are not dropped. They become suggestions, which is the
 honest description of them: two rows that look like a transfer, and a
 reason we will not say so on our own.
 """
+import re
 import uuid
 from collections import defaultdict
 from datetime import timedelta
@@ -386,3 +387,84 @@ async def unlink_transfer_pair(
         tx.transfer_pair_id = None
 
     return len(transactions)
+
+
+# Bank-side descriptions of a card bill payment, used only to break a tie.
+_BILL_PAYMENT_TEXT = re.compile(r"FATURA|CART[AÃ]O|CARD", re.IGNORECASE)
+_BILL_PAYMENT_WINDOW_DAYS = 5
+
+
+async def pair_card_bill_payments(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    candidate_ids: Optional[list[uuid.UUID]] = None,
+) -> int:
+    """Pair card bill payments with the bank debit that paid them.
+
+    A card row the statements engine classified as a ``payment`` (RFC
+    toledo-features §6.5) is a strong signal the generic matcher does not
+    have: it says *this credit is a bill payment*, so its other leg is a
+    debit of the same amount on a non-card account within a few days.
+    Rows the user ignored (duplicates, payment echoes) are not legs. A tie
+    between bank debits is broken by a bill-payment description; anything
+    still ambiguous is left alone.
+
+    As with :func:`detect_transfer_pairs`, ``candidate_ids`` limits pairs to
+    those with a new leg, so a pair the user unlinked is not re-created.
+    """
+    if candidate_ids is not None and not candidate_ids:
+        return 0
+    rows = (
+        await session.execute(
+            select(Transaction, Account.type)
+            .join(Account, Account.id == Transaction.account_id)
+            .where(
+                Transaction.workspace_id == workspace_id,
+                Transaction.transfer_pair_id.is_(None),
+                Transaction.is_ignored.is_(False),
+                Account.is_closed.is_(False),
+            )
+        )
+    ).all()
+    card_payments = [
+        tx for tx, kind in rows
+        if kind == "credit_card" and tx.card_line_kind == "payment" and tx.type == "credit"
+    ]
+    if not card_payments:
+        return 0
+    bank_debits = [tx for tx, kind in rows if kind != "credit_card" and tx.type == "debit"]
+    new_ids = None if candidate_ids is None else set(candidate_ids)
+
+    def amount(tx: Transaction) -> Decimal:
+        return abs(Decimal(tx.amount)).quantize(Decimal("0.01"))
+
+    def best_debit(payment: Transaction) -> Optional[Transaction]:
+        found = [
+            tx for tx in bank_debits
+            if amount(tx) == amount(payment)
+            and abs((tx.date - payment.date).days) <= _BILL_PAYMENT_WINDOW_DAYS
+        ]
+        if len(found) > 1:
+            found = [tx for tx in found if _BILL_PAYMENT_TEXT.search(tx.description or "")]
+        return found[0] if len(found) == 1 else None
+
+    claims: dict[uuid.UUID, list[Transaction]] = defaultdict(list)
+    chosen: dict[uuid.UUID, Transaction] = {}
+    for payment in card_payments:
+        debit = best_debit(payment)
+        if debit is not None:
+            claims[debit.id].append(payment)
+            chosen[payment.id] = debit
+
+    pairs = 0
+    for payment in card_payments:
+        debit = chosen.get(payment.id)
+        if debit is None or len(claims[debit.id]) != 1:
+            continue  # two payments claim one debit: ambiguous
+        if new_ids is not None and payment.id not in new_ids and debit.id not in new_ids:
+            continue
+        pair_id = uuid.uuid4()
+        payment.transfer_pair_id = pair_id
+        debit.transfer_pair_id = pair_id
+        pairs += 1
+    return pairs

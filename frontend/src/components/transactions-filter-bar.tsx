@@ -230,7 +230,11 @@ export function TransactionsFilterBar({
       ? t('transactions.statusPending')
       : filterStatus === 'posted'
         ? t('transactions.statusPosted')
-        : ''
+        : filterStatus === 'removed'
+          ? t('transactions.sync.filterRemoved')
+          : filterStatus === 'duplicate'
+            ? t('transactions.sync.filterDuplicates')
+            : ''
 
   const dateLabel = useMemo(() => {
     if (!filterFrom && !filterTo) return null
@@ -786,6 +790,8 @@ export function TransactionsFilterBar({
                         { value: '', label: t('transactions.all') },
                         { value: 'pending', label: t('transactions.statusPending') },
                         { value: 'posted', label: t('transactions.statusPosted') },
+                        { value: 'removed', label: t('transactions.sync.filterRemoved') },
+                        { value: 'duplicate', label: t('transactions.sync.filterDuplicates') },
                       ].map((opt) => (
                         <DropdownMenuItem
                           key={opt.value || 'all'}

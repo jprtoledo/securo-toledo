@@ -26,9 +26,19 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24  # 24 hours
 
-    # Pluggy
+    # Key that encrypts secrets stored in the database (Pluggy credentials),
+    # 32 bytes as base64 or 64 hex chars: `openssl rand -base64 32`. Losing it
+    # only means re-entering the credentials in the Admin page.
+    credentials_encryption_key: SecretStr = SecretStr("")
+
+    # Pluggy. Credentials live in the database (Admin page, one per Pluggy
+    # application). These two are only read once, on startup, to create the
+    # "Default" credential when none exists yet.
     pluggy_client_id: str = ""
     pluggy_client_secret: SecretStr = SecretStr("")
+    # Incremental syncs re-read this many days of transactions by date, on top
+    # of the ingestion-time sweep, so status/amount changes are picked up.
+    pluggy_sync_lookback_days: int = 60
     # Empty means "derive from FRONTEND_URL" (see BankProvider.redirect_uri).
     # Set explicitly only when the URL registered in the provider dashboard
     # differs from where the app is served.

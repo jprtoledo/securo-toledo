@@ -46,6 +46,11 @@ class ReportMeta(BaseModel):
     runway_date: str | None = None
     lowest_balance: float | None = None
     lowest_balance_date: str | None = None
+    # Reference-date windows (reference date ± span months): the reference
+    # date and the window.
+    reference_date: str | None = None
+    window_start: str | None = None
+    window_end: str | None = None
 
 
 class CategoryTrendItem(BaseModel):

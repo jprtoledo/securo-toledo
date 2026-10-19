@@ -435,17 +435,23 @@ async def test_update_rule_can_skip_existing_transactions(
         f"/api/rules/{create_response.json()['id']}",
         json={
             "conditions": [{"field": "description", "op": "contains", "value": "NETFLIX"}],
+            "actions": [
+                {"op": "set_category", "value": cat_food},
+                {"op": "append_notes", "value": "#streaming"},
+            ],
             "apply_to_existing": False,
         },
         headers=auth_headers,
     )
     assert update_response.status_code == 200
-    assert update_response.json()["applied_count"] == 0
 
     items = (await client.get("/api/transactions", headers=auth_headers)).json()["items"]
     netflix = {t["description"]: t for t in items}.get("NETFLIX")
     assert netflix is not None
-    assert netflix["category_id"] is None
+    # Rules v2 (AC-3.8): categories are derived, so a rule edit is retroactive
+    # for them; apply_to_existing=False keeps the other actions off history.
+    assert netflix["category_id"] == cat_food
+    assert not (netflix["notes"] or "").count("#streaming")
 
 
 @pytest.mark.asyncio
@@ -818,7 +824,7 @@ async def test_export_rules_serializes_category_actions_by_name(client: AsyncCli
     assert response.headers["content-disposition"].startswith("attachment;")
     payload = response.json()
     assert payload["format"] == "securo-categorization-rules"
-    assert payload["version"] == 1
+    assert payload["version"] == 2  # Rules v2 export; v1 still imports
     exported = {rule["name"]: rule for rule in payload["rules"]}
     assert set(exported) == {"UBER rule", "IFOOD rule", "SALARIO rule"}
     uber_action = exported["UBER rule"]["actions"][0]
@@ -1047,24 +1053,32 @@ async def test_grouped_rule_applies_to_existing_transactions(
 
 
 @pytest.mark.asyncio
-async def test_create_rule_rejects_nested_group(
+async def test_create_rule_nesting_is_capped_at_five_levels(
     client: AsyncClient, auth_headers, test_categories
 ):
-    """Groups hold leaves only — rule depth is capped at two levels."""
-    payload = {
-        "name": "Too deep",
-        "conditions_op": "and",
-        "conditions": [
-            {"op": "or", "conditions": [
-                {"op": "and", "conditions": [
-                    {"field": "description", "op": "contains", "value": "UBER"},
-                ]},
-            ]},
-        ],
-        "actions": [{"op": "set_category", "value": str(test_categories[0].id)}],
-    }
-    response = await client.post("/api/rules", json=payload, headers=auth_headers)
-    assert response.status_code == 422
+    """Rules v2 (RFC toledo-features §5.3) nests groups to any depth up to 5."""
+    leaf = {"field": "description", "op": "contains", "value": "UBER"}
+
+    def nested(levels: int) -> dict:
+        node: dict = leaf
+        for _ in range(levels - 1):
+            node = {"op": "and", "conditions": [node]}
+        return node
+
+    actions = [{"op": "set_category", "value": str(test_categories[0].id)}]
+    ok = await client.post(
+        "/api/rules",
+        json={"name": "Deep", "conditions": [nested(5)], "actions": actions},
+        headers=auth_headers,
+    )
+    assert ok.status_code == 201, ok.text
+    too_deep = await client.post(
+        "/api/rules",
+        json={"name": "Too deep", "conditions": [nested(6)], "actions": actions},
+        headers=auth_headers,
+    )
+    assert too_deep.status_code == 400
+    assert "at most 5" in too_deep.json()["detail"]
 
 
 @pytest.mark.asyncio

@@ -49,12 +49,18 @@ def register_provider(name: str, cls: type[BankProvider]) -> None:
     _PROVIDERS[name] = cls
 
 
-def get_provider(name: str) -> BankProvider:
-    """Get an instance of a registered bank provider by name."""
+def get_provider(name: str, credential=None) -> BankProvider:
+    """Get an instance of a registered bank provider by name.
+
+    ``credential`` is passed to providers bound to a per-connection
+    application (Pluggy: a ``PluggyKeys``); other providers ignore it.
+    """
     provider_class = _PROVIDERS.get(name)
     if not provider_class:
         available = ", ".join(_PROVIDERS.keys()) or "(none)"
         raise ValueError(f"Unknown provider: {name}. Available: {available}")
+    if credential is not None:
+        return provider_class(credential=credential)  # type: ignore[call-arg]
     return provider_class()
 
 
@@ -79,9 +85,10 @@ def _auto_register_providers() -> None:
     from app.core.config import get_settings
     settings = get_settings()
 
-    if settings.pluggy_client_id and settings.pluggy_client_secret:
-        from app.providers.pluggy import PluggyProvider
-        register_provider("pluggy", PluggyProvider)
+    # Always available: whether Pluggy is usable depends on the credentials
+    # stored in the database (pluggy_credential_service), not on the env.
+    from app.providers.pluggy import PluggyProvider
+    register_provider("pluggy", PluggyProvider)
 
     eb_has_key = bool(
         settings.enable_banking_private_key or settings.enable_banking_private_key_file

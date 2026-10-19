@@ -52,7 +52,9 @@ global:
   existingSecret: "my-securo-secrets"
 ```
 
-The secret must contain the corresponding keys (e.g., `secretKey`, `databaseUrl`, `agentsOpenaiApiKey`).
+The secret must contain the corresponding keys (e.g., `secretKey`, `databaseUrl`, `credentialsEncryptionKey`, `agentsOpenaiApiKey`).
+
+`credentialsEncryptionKey` (`CREDENTIALS_ENCRYPTION_KEY`) encrypts the Pluggy applications stored in the database. Generate it with `openssl rand -base64 32` and keep it with your backups; without it the Pluggy keys must be entered again in the Admin page.
 
 ## Uninstalling the Chart
 

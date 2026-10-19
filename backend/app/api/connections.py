@@ -1,3 +1,4 @@
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -24,29 +25,65 @@ from app.schemas.bank_connection import (
     OAuthCallbackRequest,
     OAuthUrlRequest,
     OAuthUrlResponse,
+    PluggyCredentialOption,
     ReauthUrlResponse,
     ReconnectTokenResponse,
 )
-from app.services import connection_service
-from app.services.transfer_detection_service import detect_transfer_pairs, unlink_transfer_pair
+from app.services import connection_service, pluggy_credential_service
+from app.services.transfer_detection_service import (
+    detect_transfer_pairs,
+    pair_card_bill_payments,
+    unlink_transfer_pair,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/connections", tags=["connections"])
 
 
 @router.get("/providers")
-async def get_available_providers():
-    """List all known open finance providers with configuration status."""
-    return {"providers": all_known_providers()}
+async def get_available_providers(
+    session: AsyncSession = Depends(get_async_session),
+):
+    """List all known open finance providers with configuration status.
+
+    Pluggy is configured when at least one Pluggy application is stored and
+    the encryption key can read it (RFC Phase 1), not by environment.
+    """
+    providers = all_known_providers()
+    pluggy_configured = await pluggy_credential_service.is_configured(session)
+    for provider in providers:
+        if provider["name"] == "pluggy":
+            provider["configured"] = provider["configured"] and pluggy_configured
+    return {"providers": providers}
+
+
+@router.get("/pluggy-credentials", response_model=list[PluggyCredentialOption])
+async def list_pluggy_credentials(
+    ctx: WorkspaceContext = Depends(current_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Pluggy applications a member can connect with — names only (AC-1.2)."""
+    return [
+        PluggyCredentialOption(id=item.credential.id, name=item.credential.name)
+        for item in await pluggy_credential_service.list_credentials(session)
+    ]
 
 
 @router.post("/connect-token", response_model=ConnectTokenResponse)
 async def create_connect_token(
     data: ConnectTokenRequest,
     ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
 ):
     """Create a connect token for widget-based bank connection flows."""
     try:
-        token_data = await connection_service.create_connect_token(data.provider, ctx.user_id)
+        token_data = await connection_service.create_connect_token(
+            data.provider,
+            ctx.user_id,
+            session=session,
+            pluggy_credential_id=data.pluggy_credential_id,
+        )
         return ConnectTokenResponse(**token_data)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -112,6 +149,7 @@ async def oauth_callback(
             state=data.state,
             sync_assets=data.sync_assets,
             reconnect_connection_id=data.reconnect_connection_id,
+            pluggy_credential_id=data.pluggy_credential_id,
         )
         return connection
     except ProviderUserActionRequired as e:
@@ -128,8 +166,10 @@ async def oauth_callback(
             status_code=status.HTTP_410_GONE, detail=str(e)
         )
     except ValueError as e:
+        logger.warning("OAuth callback rejected (%s): %s", data.provider, e)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
+        logger.exception("OAuth callback failed (%s)", data.provider)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to connect: {str(e)}",
@@ -226,7 +266,11 @@ async def get_reconnect_token(
 
     try:
         token_data = await connection_service.create_connect_token(
-            connection.provider, ctx.user_id, item_id=item_id
+            connection.provider,
+            ctx.user_id,
+            item_id=item_id,
+            session=session,
+            connection=connection,
         )
         return ReconnectTokenResponse(**token_data)
     except Exception as e:
@@ -269,6 +313,7 @@ async def detect_transfers(
 ):
     """One-time backfill scan: detect transfer pairs across all existing transactions in this workspace."""
     pairs_created = await detect_transfer_pairs(session, ctx.workspace.id)
+    pairs_created += await pair_card_bill_payments(session, ctx.workspace.id)
     await session.commit()
     return {"pairs_created": pairs_created}
 

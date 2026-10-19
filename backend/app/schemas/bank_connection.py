@@ -31,6 +31,13 @@ class BankConnectionRead(BankConnectionBase):
     status: str
     last_sync_at: Optional[datetime] = None
     created_at: datetime
+    # Pluggy: the application the connection authenticates with.
+    pluggy_credential_id: Optional[uuid.UUID] = None
+    # Provider-side item snapshot (informational; RFC toledo-features §4.3).
+    provider_status: Optional[str] = None
+    provider_execution_status: Optional[str] = None
+    provider_last_updated_at: Optional[datetime] = None
+    consent_expires_at: Optional[datetime] = None
     # Institutions this link spans. Empty for providers that are one
     # institution per connection — institution_name above covers those.
     institutions: list[ConnectionInstitutionRead] = []
@@ -53,6 +60,8 @@ class OAuthCallbackRequest(BaseModel):
     provider: Optional[str] = None
     sync_assets: Optional[bool] = None
     reconnect_connection_id: Optional[uuid.UUID] = None
+    # Pluggy: the application the widget's connect token was created with.
+    pluggy_credential_id: Optional[uuid.UUID] = None
 
 
 class ReauthUrlResponse(BaseModel):
@@ -77,6 +86,15 @@ class InstitutionListResponse(BaseModel):
 
 class ConnectTokenRequest(BaseModel):
     provider: str = "pluggy"
+    # Required for Pluggy when more than one application exists.
+    pluggy_credential_id: Optional[uuid.UUID] = None
+
+
+class PluggyCredentialOption(BaseModel):
+    """What any member sees of a Pluggy application: never the keys."""
+
+    id: uuid.UUID
+    name: str
 
 
 class ConnectTokenResponse(BaseModel):

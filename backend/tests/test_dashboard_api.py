@@ -111,7 +111,7 @@ async def test_dashboard_virtual_recurring_projection(
     # Create a weekly recurring starting on the 1st of next month
     rec_resp = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Weekly groceries",
             "amount": 50.00,
             "currency": "BRL",
@@ -183,7 +183,7 @@ async def test_dashboard_no_duplicates_on_concurrent_calls(
     # Create a monthly recurring starting next month
     await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Rent",
             "amount": 1500.00,
             "type": "debit",
@@ -243,7 +243,7 @@ async def test_recurring_projection_respects_end_date(
 
     await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Temp sub",
             "amount": 20.00,
             "type": "debit",
@@ -419,7 +419,7 @@ async def test_future_month_balance_exposes_recurring_projection_separately(
     # Create a monthly recurring expense of 500 starting next month
     rec_resp = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Rent",
             "amount": 500.00,
             "currency": "BRL",
@@ -628,7 +628,7 @@ async def test_projected_transactions_account_id_and_range(client, auth_headers,
     for account_id, desc in ((str(test_account.id), "Assinatura A"), (second_account_id, "Assinatura B")):
         rec_resp = await client.post(
             "/api/recurring-transactions",
-            json={
+            json={"auto_generate": True, 
                 "description": desc,
                 "amount": 30.00,
                 "currency": "BRL",
@@ -680,7 +680,7 @@ async def test_projected_transactions_range_excludes_outside_dates(
 
     rec_resp = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "Aluguel",
             "amount": 900.00,
             "currency": "BRL",
@@ -724,7 +724,7 @@ async def test_projected_transactions_excludes_materialized_occurrence(
     occurrence = _next_month_str()
     rec_resp = await client.post(
         "/api/recurring-transactions",
-        json={
+        json={"auto_generate": True, 
             "description": "CXC - Auth0",
             "amount": 13037.13,
             "currency": "BRL",

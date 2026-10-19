@@ -33,7 +33,23 @@ class BankConnection(Base):
     credentials: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # Encrypted tokens
     settings: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True, default=dict)
     status: Mapped[str] = mapped_column(String(50), default="active")  # active, error, expired
+    # Pluggy only: the application (credential) the Item was created with.
+    # Every call for this connection authenticates with it. RESTRICT: a
+    # credential in use cannot be deleted.
+    pluggy_credential_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pluggy_credentials.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     last_sync_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Informational snapshot of the provider-side item, refreshed on every
+    # sync (Pluggy: status, executionStatus, lastUpdatedAt,
+    # consentExpiresAt). The connection lifecycle does not depend on them.
+    provider_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    provider_execution_status: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    provider_last_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    consent_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     user: Mapped["User"] = relationship(back_populates="bank_connections")

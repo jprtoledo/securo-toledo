@@ -12,7 +12,12 @@ import { invalidateFinancialQueries } from '@/lib/invalidate-queries'
 import { shouldShowPendingBadge } from '@/lib/transaction-status'
 import { closeDateForBill, isOpenCycleWindow } from '@/lib/credit-card-cycle'
 import { toast } from 'sonner'
-import type { CreditCardBill, ProjectedTransaction, Transaction } from '@/types'
+import type { CardStatement, CreditCardBill, ProjectedTransaction, Transaction } from '@/types'
+import { CardStatementsPanel } from '@/components/card-statements-panel'
+import { InstallmentPlansPanel } from '@/components/installment-plans-panel'
+import { CardForecastChart } from '@/components/card-forecast-chart'
+import { CardLimitUsage } from '@/components/card-limit-usage'
+import { availableForecast, statementAmounts } from '@/lib/card-forecast'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Button } from '@/components/ui/button'
 import { ArrowLeft, ArrowLeftRight, CalendarClock, ChevronLeft, ChevronRight, Clock, EyeClosed, HelpCircle, Paperclip, Pencil, Plus, X } from 'lucide-react'
@@ -273,6 +278,7 @@ export default function AccountDetailPage() {
   const isMobile = useIsMobile()
   const queryClient = useQueryClient()
   const [dialogOpen, setDialogOpen] = useState(false)
+  const [cardTab, setCardTab] = useState<'statements' | 'installments'>('statements')
   const [editingTx, setEditingTx] = useState<Transaction | null>(null)
   const [transferDialogOpen, setTransferDialogOpen] = useState(false)
   const {
@@ -314,13 +320,42 @@ export default function AccountDetailPage() {
     if (!bills) return []
     return [...bills].sort((a, b) => a.due_date.localeCompare(b.due_date))
   }, [bills])
+  // Pluggy cards: months come from the statements engine (RFC toledo-features
+  // §6.4) — rows are bucketed by their reference month, and open/future
+  // statements carry projected parcels and recurring charges. Each statement
+  // maps to the window [previous closing, closing − 1] so the date pickers,
+  // label and chart keep working; the rows themselves are fetched by month.
+  const { data: statementsData, isPending: statementsPending } = useQuery({
+    queryKey: ['accounts', id, 'statements'],
+    queryFn: () => accounts.statements(id!),
+    enabled: !!id && account?.type === 'credit_card',
+  })
+  // A card waits for its statements before asking for anything else, so the
+  // date-window numbers never flash before the reference-month ones.
+  const cycleReady = !!account && (account.type !== 'credit_card' || !statementsPending)
+  const statementPeriods = useMemo(() => {
+    if (!statementsData?.reference_months) return []
+    const list = statementsData.statements.filter(st => st.closing_date)
+    return list.map((st, i) => {
+      const closing = parseISO(st.closing_date + 'T00:00:00')
+      const prev = i > 0 ? list[i - 1] : null
+      const start = prev?.closing_date ?? format(addMonths(closing, -1), 'yyyy-MM-dd')
+      return { start, end: format(addDays(closing, -1), 'yyyy-MM-dd'), statement: st }
+    })
+  }, [statementsData])
+  const openStatementIndex = useMemo(() => {
+    const i = statementPeriods.findIndex(p => p.statement.month === statementsData?.open_month)
+    return i >= 0 ? i : statementPeriods.length - 1
+  }, [statementPeriods, statementsData?.open_month])
+  const activeStatementIndex = statementPeriods.findIndex(p => p.start === filterFrom && p.end === filterTo)
+  const activeStatement = activeStatementIndex >= 0 ? statementPeriods[activeStatementIndex].statement : null
   // The bill, if any, the active filter currently corresponds to. We always
   // set filterTo = bill.due_date when navigating to a bill, so the lookup is
   // a simple equality check.
   const activeBill = useMemo(() => {
-    if (!billsAsc.length) return null
+    if (!billsAsc.length || statementPeriods.length) return null
     return billsAsc.find(b => b.due_date === filterTo) ?? null
-  }, [billsAsc, filterTo])
+  }, [billsAsc, filterTo, statementPeriods.length])
   // True when the user is on the trailing in-progress cycle. Backend uses this
   // to exclude already-billed txs from the cycle window so they don't double-
   // count against the in-progress bar/total.
@@ -352,10 +387,14 @@ export default function AccountDetailPage() {
     return cycle.start === filterFrom && cycle.end === filterTo
   }, [account?.statement_close_day, filterFrom, filterTo])
 
-  const [cycleSource, setCycleSource] = useState<{ account: typeof account; bills: typeof bills } | null>(null)
-  if (!cycleSource || cycleSource.account !== account || cycleSource.bills !== bills) {
-    setCycleSource({ account, bills })
-    if (account?.type === 'credit_card' && !filterTouched) {
+  const [cycleSource, setCycleSource] = useState<{ account: typeof account; bills: typeof bills; statements: typeof statementPeriods } | null>(null)
+  if (!cycleSource || cycleSource.account !== account || cycleSource.bills !== bills || cycleSource.statements !== statementPeriods) {
+    setCycleSource({ account, bills, statements: statementPeriods })
+    if (account?.type === 'credit_card' && !filterTouched && statementPeriods.length) {
+      const open = statementPeriods[openStatementIndex]
+      setFilterFrom(open.start)
+      setFilterTo(open.end)
+    } else if (account?.type === 'credit_card' && !filterTouched) {
       const today = format(new Date(), 'yyyy-MM-dd')
       const upcomingIndex = billsAsc.findIndex(b => b.due_date >= today)
       const upcoming = billsAsc[upcomingIndex]
@@ -369,8 +408,25 @@ export default function AccountDetailPage() {
     }
   }
 
+  const selectStatementMonth = (month: string) => {
+    const period = statementPeriods.find(p => p.statement.month === month)
+    if (!period) return
+    setFilterTouched(true)
+    setFilterFrom(period.start)
+    setFilterTo(period.end)
+  }
+
   const shiftCycleBy = (direction: -1 | 1) => {
     setFilterTouched(true)
+    if (statementPeriods.length) {
+      const current = activeStatementIndex >= 0
+        ? activeStatementIndex
+        : Math.max(0, statementPeriods.findIndex(p => p.end >= filterTo))
+      const next = statementPeriods[Math.min(statementPeriods.length - 1, Math.max(0, current + direction))]
+      setFilterFrom(next.start)
+      setFilterTo(next.end)
+      return
+    }
     // Bill-aware nav: step through the bills list when we have it, so prev/next
     // mirrors the bank's actual statements (handles dynamic close days).
     if (billsAsc.length > 0) {
@@ -432,7 +488,7 @@ export default function AccountDetailPage() {
       activeBill?.id,
       isInProgressCycle || undefined,
     ),
-    enabled: !!id,
+    enabled: !!id && cycleReady && !activeStatement,
   })
 
   // Previous cycle (for the Total da fatura comparison subtitle).
@@ -446,7 +502,7 @@ export default function AccountDetailPage() {
   const { data: previousCycleSummary } = useQuery({
     queryKey: ['accounts', id, 'summary', previousCycle?.start, previousCycle?.end],
     queryFn: () => accounts.summary(id!, previousCycle!.start, previousCycle!.end),
-    enabled: !!id && !!previousCycle,
+    enabled: !!id && cycleReady && !!previousCycle && !activeStatement,
   })
 
   // Last 6 cycles (oldest → newest) for the bill timeline strip.
@@ -455,8 +511,17 @@ export default function AccountDetailPage() {
   // bill's actual due_date — so the bars match the bank statement-for-statement
   // even when the close day shifts month to month (issue #92). Otherwise we
   // fall back to local cycle math.
-  const timelineCycles: { start: string; end: string; bill?: CreditCardBill }[] = useMemo(() => {
+  const timelineCycles: { start: string; end: string; bill?: CreditCardBill; statement?: CardStatement }[] = useMemo(() => {
     if (!account || account.type !== 'credit_card') return []
+
+    if (statementPeriods.length) {
+      // Up to the open statement and the next one; following the selection
+      // into history or into future months.
+      const size = isMobile ? 4 : 6
+      const anchor = Math.max(openStatementIndex + 1, activeStatementIndex)
+      const end = Math.min(statementPeriods.length, anchor + 1)
+      return statementPeriods.slice(Math.max(0, end - size), end)
+    }
 
     if (billsAsc.length > 0) {
       const cycles: { start: string; end: string; bill?: CreditCardBill }[] = []
@@ -489,7 +554,7 @@ export default function AccountDetailPage() {
       ref = new Date(parseISO(c.start + 'T00:00:00').getTime() - 86400000)
     }
     return cycles
-  }, [account, billsAsc, isMobile])
+  }, [account, billsAsc, isMobile, statementPeriods, openStatementIndex, activeStatementIndex])
 
   const timelineQueries = useQueries({
     queries: timelineCycles.map(c => ({
@@ -505,13 +570,19 @@ export default function AccountDetailPage() {
         id!, c.start, c.end, c.bill?.id,
         c.bill ? undefined : (billsAsc.length > 0 || undefined),
       ),
-      enabled: !!id,
+      enabled: !!id && cycleReady && !c.statement,
     })),
   })
 
   const { data: txData, isLoading: txLoading } = useQuery({
-    queryKey: ['transactions', { account_id: id, bill_id: activeBill?.id, from: filterFrom, to: filterTo, limit: 500, include_opening_balance: true, unbilled_only: isInProgressCycle }],
-    queryFn: () => transactions.list({
+    queryKey: activeStatement
+      ? ['transactions', { account_id: id, statement_month: activeStatement.month, limit: 500 }]
+      : ['transactions', { account_id: id, bill_id: activeBill?.id, from: filterFrom, to: filterTo, limit: 500, include_opening_balance: true, unbilled_only: isInProgressCycle }],
+    queryFn: () => activeStatement ? transactions.list({
+      account_id: id,
+      statement_month: activeStatement.month,
+      limit: 500,
+    }) : transactions.list({
       account_id: id,
       // When the active cycle is a real bill, prefer bill_id (Pluggy's
       // truth — picks up charges the bank rolled outside the nominal date
@@ -527,7 +598,7 @@ export default function AccountDetailPage() {
       limit: 500,
       include_opening_balance: true,
     }),
-    enabled: !!id,
+    enabled: !!id && cycleReady,
   })
 
   // Non-materialized recurring projections are forecast rows. They are kept
@@ -774,9 +845,56 @@ export default function AccountDetailPage() {
     return series
   }, [isCreditCard, txData, projectedRows, filterFrom, filterTo, dateLocale, usePrimary, displayCurrency, summary, openingBalance, activeBill])
 
+  // Open/future statements: the parcels and recurring charges still to come,
+  // as forecast rows (RFC §6.4) — part of the statement's estimated total.
+  const statementProjectedRows = useMemo((): TxWithBalance[] => {
+    if (!activeStatement?.projected_items?.length) return []
+    const fallbackDate = activeStatement.closing_date ?? activeStatement.month
+    return activeStatement.projected_items.map((item, i): TxWithBalance => {
+      const amount = Number(item.amount)
+      const parcel = item.source === 'installment' && item.number != null && item.total != null
+      return {
+        id: `statement-projected-${activeStatement.month}-${i}`,
+        user_id: '',
+        account_id: id ?? null,
+        category_id: item.category_id,
+        category: categoriesList?.find(c => c.id === item.category_id) ?? null,
+        external_id: null,
+        description: item.description,
+        original_description: null,
+        amount: Math.abs(amount),
+        currency: account?.currency ?? userCurrency,
+        date: item.date ?? fallbackDate,
+        type: amount >= 0 ? 'debit' : 'credit',
+        source: 'projected',
+        status: 'posted',
+        payee: null,
+        payee_id: null,
+        payee_name: null,
+        notes: null,
+        transfer_pair_id: null,
+        amount_primary: null,
+        fx_rate_used: null,
+        fx_fallback: false,
+        installment_series_id: null,
+        installment_number: parcel ? item.number! : null,
+        total_installments: parcel ? item.total! : null,
+        installment_total_amount: null,
+        installment_purchase_date: null,
+        bill_id: null,
+        effective_bill_date: null,
+        recurring_transaction_id: item.source === 'recurrence' ? item.ref_id : null,
+        splits: [],
+        is_ignored: false,
+        virtual: true,
+        runningBalance: 0,
+      }
+    })
+  }, [activeStatement, id, categoriesList, account?.currency, userCurrency])
+
   const ccRunningTotal = useMemo((): TxWithBalance[] => {
     if (!isCreditCard || !txData?.items) return []
-    const ascending = [...txData.items].sort(
+    const ascending = [...txData.items, ...statementProjectedRows].sort(
       (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
     )
     let running = 0
@@ -790,7 +908,7 @@ export default function AccountDetailPage() {
       return { ...tx, runningBalance: running }
     })
     return withBalance.reverse()
-  }, [txData, isCreditCard, usePrimary, displayCurrency])
+  }, [txData, statementProjectedRows, isCreditCard, usePrimary, displayCurrency])
 
   // Merged list: real transactions, pending rows, and virtual recurring
   // projections. The newest row is the forecast at the end of the range.
@@ -825,7 +943,9 @@ export default function AccountDetailPage() {
   const hasProjectedExpenses = Math.abs(projectedExpenses - actualExpenses) > 0.005
 
   const resolvedDefaultRange = account?.type === 'credit_card'
-    ? defaultCycleForCreditCard(account.statement_close_day, account.payment_due_day, new Date())
+    ? (statementPeriods.length
+        ? statementPeriods[openStatementIndex]
+        : defaultCycleForCreditCard(account.statement_close_day, account.payment_due_day, new Date()))
     : { start: defaultFrom(), end: defaultTo() }
   const hasFilters = filterFrom !== resolvedDefaultRange.start || filterTo !== resolvedDefaultRange.end
 
@@ -962,7 +1082,11 @@ export default function AccountDetailPage() {
                     type="button"
                     className="inline-flex items-center justify-center gap-2 min-w-[140px] border border-border rounded-lg px-3 py-1.5 text-sm bg-card text-foreground hover:bg-muted/50 transition-all cursor-pointer capitalize"
                   >
-                    {activeBill
+                    {activeStatement
+                      ? format(parseISO(activeStatement.month + 'T00:00:00'), 'MMM yyyy', {
+                          locale: resolveDateFnsLocale(i18n.resolvedLanguage ?? i18n.language),
+                        })
+                      : activeBill
                       ? format(parseISO(activeBill.due_date + 'T00:00:00'), 'MMM yyyy', {
                           locale: resolveDateFnsLocale(i18n.resolvedLanguage ?? i18n.language),
                         })
@@ -1023,10 +1147,14 @@ export default function AccountDetailPage() {
             <Button
               variant="ghost"
               size="sm"
-              className="text-muted-foreground hover:text-foreground min-h-[44px] min-w-[44px] px-3 shrink-0"
+              className="text-muted-foreground hover:text-foreground h-8 min-w-[44px] px-3 shrink-0"
               onClick={() => {
                 setFilterTouched(false)
-                if (account?.type === 'credit_card') {
+                if (account?.type === 'credit_card' && statementPeriods.length) {
+                  const open = statementPeriods[openStatementIndex]
+                  setFilterFrom(open.start)
+                  setFilterTo(open.end)
+                } else if (account?.type === 'credit_card') {
                   const { start, end } = defaultCycleForCreditCard(
                     account.statement_close_day,
                     account.payment_due_day,
@@ -1079,8 +1207,18 @@ export default function AccountDetailPage() {
         </div>
       )}
 
+      {/* Statement totals over time — Pluggy cards (reference months) */}
+      {isCreditCard && statementPeriods.length > 0 && statementsData && (
+        <CardForecastChart
+          statements={statementsData.statements}
+          currency={account.currency}
+          selectedMonth={activeStatement?.month ?? null}
+          onSelect={selectStatementMonth}
+        />
+      )}
+
       {/* Bill timeline (last 6 cycles) — only for CC with cycle metadata */}
-      {isCreditCard && timelineCycles.length > 0 && (() => {
+      {isCreditCard && !statementPeriods.length && timelineCycles.length > 0 && (() => {
         const dfLocale = resolveDateFnsLocale(i18n.resolvedLanguage ?? i18n.language)
         const totals = timelineQueries.map((q, i) => {
           const c = timelineCycles[i]
@@ -1088,11 +1226,13 @@ export default function AccountDetailPage() {
           // filtered by bill_id when the cycle has a bill (handles dynamic
           // close days) or by [start, end] otherwise. Same number whether
           // the bar is active or not — clicking doesn't shift the value.
-          const total = Number(q.data?.projected_expenses ?? q.data?.monthly_expenses ?? 0)
+          const total = c.statement
+            ? Number(c.statement.total)
+            : Number(q.data?.projected_expenses ?? q.data?.monthly_expenses ?? 0)
           return {
             ...c,
             total,
-            loading: q.isLoading,
+            loading: c.statement ? false : q.isLoading,
           }
         })
         const max = Math.max(1, ...totals.map(c => c.total))
@@ -1105,7 +1245,9 @@ export default function AccountDetailPage() {
                 // When a bill anchors this cycle, label by the bill's actual
                 // month (handles dynamic close days). Otherwise fall back to
                 // the cycle-math label that maps close → due → month.
-                const label = c.bill
+                const label = c.statement
+                  ? format(parseISO(c.statement.month + 'T00:00:00'), 'MMM yyyy', { locale: dfLocale })
+                  : c.bill
                   ? format(parseISO(c.bill.due_date + 'T00:00:00'), 'MMM yyyy', { locale: dfLocale })
                   : creditCardCycleLabel(c.end, account.payment_due_day, i18n.language)
                 return (
@@ -1150,14 +1292,18 @@ export default function AccountDetailPage() {
         // can lag any charges added since the last sync). Otherwise use the
         // summary endpoint's monthly_expenses now nets refund credits against
         // debits for CC accounts (matches the bank's bill total).
-        const billTotal = (showPrimary ? summary?.projected_expenses_primary : undefined) ?? summary?.projected_expenses ?? summary?.monthly_expenses ?? 0
+        const billTotal = activeStatement
+          ? Number(activeStatement.total)
+          : (showPrimary ? summary?.projected_expenses_primary : undefined) ?? summary?.projected_expenses ?? summary?.monthly_expenses ?? 0
         // "Default cycle" = the bill the user is here to pay (next due). The
         // AGORA tag on Limite disponível only shows when viewing a different cycle.
         const isDefaultCycle =
           filterFrom === resolvedDefaultRange.start && filterTo === resolvedDefaultRange.end
         // Compute the due date for THIS cycle. activeBill.due_date is the
         // bank-truth date and varies month-to-month with weekends/holidays.
-        const cycleDueDate = activeBill
+        const cycleDueDate = activeStatement
+          ? activeStatement.due_date
+          : activeBill
           ? activeBill.due_date
           : dueDateForCycle(filterTo, account.payment_due_day)
         const dueIn = cycleDueDate ? daysUntil(cycleDueDate) : null
@@ -1194,27 +1340,76 @@ export default function AccountDetailPage() {
             prevLabelBill = newest
           }
         }
-        const prevTotal = prevLabelBill
+        const prevStatement = activeStatementIndex > 0 ? statementPeriods[activeStatementIndex - 1].statement : null
+        const prevTotal = activeStatement
+          ? Number(prevStatement?.total ?? 0)
+          : prevLabelBill
           ? Number(prevLabelBill.total_amount)
           : previousCycleSummary?.monthly_expenses ?? 0
-        const showComparison = (prevLabelBill || previousCycle) && prevTotal > 0
+        const showComparison = (activeStatement ? prevStatement : (prevLabelBill || previousCycle)) && prevTotal > 0
         const deltaPct = showComparison ? ((billTotal - prevTotal) / prevTotal) * 100 : null
-        const prevCycleLabel = prevLabelBill
+        const prevCycleLabel = activeStatement
+          ? (prevStatement
+              ? format(parseISO(prevStatement.month + 'T00:00:00'), 'MMM yyyy', {
+                  locale: resolveDateFnsLocale(i18n.resolvedLanguage ?? i18n.language),
+                })
+              : null)
+          : prevLabelBill
           ? format(parseISO(prevLabelBill.due_date + 'T00:00:00'), 'MMM yyyy', {
               locale: resolveDateFnsLocale(i18n.resolvedLanguage ?? i18n.language),
             })
           : previousCycle
             ? creditCardCycleLabel(previousCycle.end, account.payment_due_day, i18n.language)
             : null
+        // Real = what is already on the statement; forecast = with the
+        // parcels and expected recurring charges still to come (open and
+        // future statements only).
+        const amounts = activeStatement ? statementAmounts(activeStatement) : null
+        const legacyReal = (showPrimary ? summary?.monthly_expenses_primary : undefined) ?? summary?.monthly_expenses ?? billTotal
+        const realTotal = amounts ? amounts.real : legacyReal
+        const forecastTotal = amounts
+          ? amounts.forecast
+          : (Math.abs(billTotal - legacyReal) > 0.005 ? billTotal : null)
+        const forecastHint = amounts && amounts.forecast != null
+          ? t('accounts.forecastBreakdown', {
+              installments: mask(formatCurrency(amounts.installments, displayCurrency, locale)),
+              recurring: mask(formatCurrency(amounts.recurring, displayCurrency, locale)),
+            })
+          : undefined
+        const availableNow = account.available_credit != null ? Number(account.available_credit) : null
+        const availableLater = activeStatement && statementsData
+          ? availableForecast(
+              statementsData.statements,
+              activeStatement.month,
+              availableNow,
+              account.credit_limit != null ? Number(account.credit_limit) : null,
+            )
+          : null
+        const statementMonthLabel = activeStatement
+          ? format(parseISO(activeStatement.month + 'T00:00:00'), 'MMM yyyy', {
+              locale: resolveDateFnsLocale(i18n.resolvedLanguage ?? i18n.language),
+            })
+          : null
         return (
           <div className="grid grid-cols-3 gap-2 sm:gap-4 mb-6">
-            <div className="bg-card rounded-xl border border-border shadow-sm p-3 sm:p-4 overflow-hidden">
-              <p className="text-[10px] sm:text-xs font-medium text-muted-foreground mb-1 truncate">
+            <div className="bg-card rounded-xl border border-border shadow-sm p-3 sm:p-4 overflow-hidden" data-testid="bill-total-card">
+              <p className="text-[10px] sm:text-xs font-medium text-muted-foreground mb-1 flex items-center gap-1 truncate">
                 {t('accounts.cycleBillTotal')}
+                {forecastTotal != null && (
+                  <span className="inline-flex items-center px-1 py-0 rounded text-[8px] sm:text-[9px] font-bold uppercase tracking-wide bg-muted text-muted-foreground shrink-0">
+                    {t('accounts.realTag')}
+                  </span>
+                )}
               </p>
               <p className="text-[length:clamp(0.7rem,3.5vw,1.25rem)] sm:text-2xl font-bold tabular-nums text-foreground">
-                {mask(formatCurrency(billTotal, displayCurrency, locale))}
+                {mask(formatCurrency(realTotal, displayCurrency, locale))}
               </p>
+              {forecastTotal != null && (
+                <p className="text-[10px] sm:text-xs mt-0.5 tabular-nums text-muted-foreground" title={forecastHint}>
+                  <span className="block sm:inline">{t('accounts.forecastLabel')}</span>{' '}
+                  <span className="font-semibold text-foreground">{mask(formatCurrency(forecastTotal, displayCurrency, locale))}</span>
+                </p>
+              )}
               {deltaPct != null && prevCycleLabel && (
                 <p className={`text-[10px] sm:text-xs font-medium mt-0.5 tabular-nums ${deltaPct > 0 ? 'text-rose-500' : 'text-emerald-600'}`}>
                   {deltaPct > 0 ? '+' : ''}{deltaPct.toFixed(0)}% <span className="text-muted-foreground font-normal">vs {prevCycleLabel}</span>
@@ -1233,6 +1428,18 @@ export default function AccountDetailPage() {
                   ? mask(formatCurrency(Number(account.available_credit), account.currency, locale))
                   : '—'}
               </p>
+              {availableLater != null && statementMonthLabel && (
+                <p
+                  className="text-[10px] sm:text-xs mt-0.5 tabular-nums text-muted-foreground"
+                  title={t('accounts.availableForecastHint')}
+                  data-testid="available-forecast"
+                >
+                  <span className="block sm:inline">{t('accounts.forecastIn', { month: statementMonthLabel })}</span>{' '}
+                  <span className={`font-semibold ${availableLater < 0 ? 'text-rose-500' : 'text-foreground'}`}>
+                    {mask(formatCurrency(availableLater, account.currency, locale))}
+                  </span>
+                </p>
+              )}
             </div>
             <div className="bg-card rounded-xl border border-border shadow-sm p-3 sm:p-4 overflow-hidden">
               <p className="text-[10px] sm:text-xs font-medium text-muted-foreground mb-1 truncate">
@@ -1311,7 +1518,9 @@ export default function AccountDetailPage() {
         // currently being viewed. For the current cycle this matches the "current
         // open balance" since nothing has been paid yet; for past cycles it shows
         // that month's burn rate against the (current) limit.
-        const cycleBillTotal = (showPrimary ? summary?.projected_expenses_primary : undefined) ?? summary?.projected_expenses ?? summary?.monthly_expenses ?? 0
+        const cycleBillTotal = activeStatement
+          ? Number(activeStatement.total)
+          : (showPrimary ? summary?.projected_expenses_primary : undefined) ?? summary?.projected_expenses ?? summary?.monthly_expenses ?? 0
         const utilized = limit != null ? cycleBillTotal : null
         const rawPct = limit != null && limit > 0 && utilized != null ? (utilized / limit) * 100 : null
         const pct = rawPct != null ? Math.min(100, rawPct) : null
@@ -1346,7 +1555,16 @@ export default function AccountDetailPage() {
                 </button>
               )}
             </div>
-            {limit != null && pct != null && rawPct != null && (
+            {statementPeriods.length > 0 && statementsData ? (
+              <CardLimitUsage
+                statements={statementsData.statements}
+                limit={limit}
+                availableCredit={account.available_credit != null ? Number(account.available_credit) : null}
+                currency={account.currency}
+                selectedMonth={activeStatement?.month ?? null}
+                onSelect={selectStatementMonth}
+              />
+            ) : limit != null && pct != null && rawPct != null && (
               <>
                 <div className="flex items-baseline justify-between mb-2">
                   <p className="text-[10px] sm:text-xs font-medium text-muted-foreground uppercase tracking-wide">
@@ -1385,7 +1603,9 @@ export default function AccountDetailPage() {
                   {t('accounts.statementCloseDay')}
                 </p>
                 <p className="text-sm sm:text-base font-semibold tabular-nums text-foreground">
-                  {activeBill
+                  {activeStatement?.closing_date
+                    ? formatDateStr(activeStatement.closing_date, dateLocale)
+                    : activeBill
                     ? formatDateStr(closeDateForBill(activeBill.due_date, account.statement_close_day), dateLocale)
                     : (account.statement_close_day && filterTo
                         ? formatDateStr(format(addDays(parseISO(filterTo), 1), 'yyyy-MM-dd'), dateLocale)
@@ -1540,6 +1760,29 @@ export default function AccountDetailPage() {
         )
       })()}
 
+      {/* Statements per bill month (RFC toledo-features §6.4) */}
+      {isCreditCard && account && (
+        <section className="mb-6 rounded-xl border border-border/60 bg-card p-4">
+          <div className="mb-3 flex items-center gap-1 rounded-lg bg-muted p-0.5 w-fit" role="tablist">
+            {(['statements', 'installments'] as const).map(tab => (
+              <button
+                key={tab}
+                type="button"
+                role="tab"
+                aria-selected={cardTab === tab}
+                className={`px-3 py-1 text-xs font-semibold rounded-md transition-all ${cardTab === tab ? 'bg-card shadow-sm text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                onClick={() => setCardTab(tab)}
+              >
+                {tab === 'statements' ? t('accounts.statements.title') : t('installments.title')}
+              </button>
+            ))}
+          </div>
+          {cardTab === 'statements'
+            ? <CardStatementsPanel accountId={account.id} currency={account.currency} />
+            : <InstallmentPlansPanel accountId={account.id} currency={account.currency} />}
+        </section>
+      )}
+
       {/* Transaction table */}
       <div className="bg-card rounded-xl border border-border shadow-sm overflow-hidden">
         <div className="px-5 py-4 border-b border-border">
@@ -1579,6 +1822,7 @@ export default function AccountDetailPage() {
                         // The opening-balance row is synthetic; the desktop
                         // table makes it non-clickable and mobile must match.
                         if (clickedTx.source === 'opening_balance') return
+                        if ((clickedTx as TxWithBalance).virtual) return
                         if (!clickedTx.is_shared && canWrite) {
                           setEditingTx(clickedTx)
                           setDialogOpen(true)
@@ -1663,6 +1907,9 @@ export default function AccountDetailPage() {
                                   : undefined}
                               >
                                 {tx.installment_number}/{tx.total_installments}
+                                {tx.installment_link === 'conflict' && (
+                                  <span className="ml-0.5 text-rose-600" title={t('installments.conflictBadge')}>!</span>
+                                )}
                               </span>
                             )}
                             {shouldShowPendingBadge(tx) && (

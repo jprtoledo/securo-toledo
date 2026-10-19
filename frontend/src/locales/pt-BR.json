@@ -880,7 +880,8 @@
     "fxRateUsed": "Taxa de câmbio: {{rate}}",
     "refreshRates": "Atualizar taxas de câmbio",
     "ratesRefreshed": "Taxas de câmbio atualizadas",
-    "ratesError": "Erro ao atualizar taxas de câmbio"
+    "ratesError": "Erro ao atualizar taxas de câmbio",
+    "balanceForecastLegend": "Previsão"
   },
   "transactions": {
     "title": "Transações",
@@ -1150,7 +1151,43 @@
     "invoiceBadgeTooltip": "Esta transação quita uma cobrança. Abrir.",
     "suggestionBadge": "Pergunta",
     "suggestionBadgeTooltip": "Um pagamento pode quitar esta cobrança. Abra a fila para responder.",
-    "clearGroupFilter": "Limpar filtro de grupo"
+    "clearGroupFilter": "Limpar filtro de grupo",
+    "sync": {
+      "filterRemoved": "Removidas pelo banco",
+      "filterDuplicates": "Duplicadas",
+      "removedByBank": "Removida pelo banco em {{date}}",
+      "removedHint": "Ela não conta mais em saldos e relatórios. Deixe de ignorar para mantê-la assim mesmo.",
+      "removedKept": "Você escolheu mantê-la: ela continua contando.",
+      "duplicateOf": "Duplicata de “{{description}}” ({{date}}) — não é contada.",
+      "duplicateOfUnknown": "Duplicata de outra transação — não é contada.",
+      "notDuplicate": "Não é duplicata",
+      "notDuplicateDone": "Marcada como não duplicada",
+      "lock": "Não atualizar pelo banco",
+      "lockHint": "Mantém valor, data, descrição e status como estão agora, mesmo que o banco mude.",
+      "locked": "Atualizações do banco pausadas para esta transação",
+      "unlocked": "Atualizações do banco retomadas",
+      "providerDetails": "Detalhes do banco",
+      "operationType": "Tipo de operação",
+      "cardNumber": "Cartão",
+      "merchant": "Estabelecimento",
+      "mcc": "MCC",
+      "providerCategory": "Categoria do banco",
+      "paymentType": "Forma de pagamento",
+      "billId": "Id da fatura",
+      "rawDescription": "Texto original",
+      "placedIn": "Conta na fatura que vence em {{date}}:",
+      "placedBy": {
+        "manual": "você a moveu para lá.",
+        "bill": "o banco a lançou nessa fatura.",
+        "forecast": "a previsão de fatura do banco.",
+        "post_date": "a data de lançamento do banco.",
+        "cycle": "a data dela no ciclo da fatura.",
+        "tx_date": "a própria data."
+      },
+      "cardKindIs": "Linha da fatura: {{kind}}.",
+      "carriedOver": "(repetida da fatura anterior)",
+      "byRule": "(por regra)"
+    }
   },
   "accounts": {
     "title": "Contas",
@@ -1304,7 +1341,71 @@
       "active": "Ativa",
       "error": "Erro",
       "expired": "Expirada"
-    }
+    },
+    "statements": {
+      "title": "Faturas",
+      "empty": "Nenhuma fatura ainda.",
+      "howPlaced": "Como posicionamos compras da fatura aberta",
+      "cycleDerived": "Fecha no dia {{closing}}, vence no dia {{due}} (aprendido das faturas).",
+      "cycleManual": "Fecha no dia {{closing}}, vence no dia {{due}} (definido por você).",
+      "cycleUnknown": "O ciclo da fatura ainda não é conhecido.",
+      "truthSamples_one": "Medido em {{count}} compra já em fatura.",
+      "truthSamples_other": "Medido em {{count}} compras já em fatura.",
+      "forecastOffset_one": "A previsão do banco erra por {{count}} mês; corrigido.",
+      "forecastOffset_other": "A previsão do banco erra por {{count}} meses; corrigido.",
+      "method": {
+        "forecast": "Previsão de fatura do banco",
+        "post_date": "Data de lançamento do banco",
+        "cycle": "Data da compra no ciclo"
+      },
+      "state": {
+        "closed": "Fechada",
+        "closed_estimated": "Fechada (estimada)",
+        "open": "Aberta",
+        "future": "Futura"
+      },
+      "status": {
+        "paid": "Paga em {{date}}",
+        "due": "A vencer",
+        "overdue": "Vencida",
+        "nothing_due": "Nada a pagar",
+        "not_closed": "Ainda não fechou",
+        "unknown": "Pagamento desconhecido"
+      },
+      "closing": "Fecha",
+      "due": "Vence",
+      "spent": "Gastos",
+      "prepaid": "Antecipado",
+      "paid": "Pago",
+      "minimum": "Mínimo",
+      "projectedInstallments_one": "{{count}} parcela a vir",
+      "projectedInstallments_other": "{{count}} parcelas a vir",
+      "projectedRecurring_one": "{{count}} cobrança recorrente prevista",
+      "projectedRecurring_other": "{{count}} cobranças recorrentes previstas",
+      "reconciliationDiff": "Difere do total do banco em {{diff}}",
+      "beforeHistory": "Anterior à primeira transação sincronizada: só o total do banco é conhecido.",
+      "firstHistory": "Primeiro mês com transações: o início do ciclo pode faltar.",
+      "estimatedNote": "≈ total estimado · * data estimada"
+    },
+    "forecast": {
+      "committed": "Lançado + parcelas",
+      "withRecurring": "Com recorrências previstas",
+      "range": "Período",
+      "today": "Hoje",
+      "posted": "Lançado",
+      "installments": "Parcelas a vencer"
+    },
+    "limitUsage": {
+      "aria": "{{used}} de {{limit}} usados",
+      "unexplained": "Não detalhado",
+      "unexplainedHint": "Limite usado informado pelo banco além das faturas que o Securo consegue detalhar (ex.: parcelas de compras anteriores ao histórico sincronizado).",
+      "selected": "{{month}}: {{amount}}"
+    },
+    "realTag": "Real",
+    "forecastLabel": "Previsto",
+    "forecastBreakdown": "Parcelas a vencer {{installments}} · Recorrências previstas {{recurring}}",
+    "forecastIn": "Previsto {{month}}:",
+    "availableForecastHint": "Limite disponível esperado enquanto esta fatura estiver aberta: com as faturas anteriores pagas e as recorrências previstas nela."
   },
   "connections": {
     "settings": "Configurações da conexão",
@@ -1322,7 +1423,12 @@
     "syncAssetsHint": "Quando desativado, esta conexão sincroniza contas e transações, mas não altera os investimentos do provedor.",
     "initialSyncSettings": "Opções de sincronização",
     "initialSyncSettingsDesc": "Escolha o que o Securo deve importar antes de abrir o conector.",
-    "continueToConnector": "Continuar para o conector"
+    "continueToConnector": "Continuar para o conector",
+    "pluggyApplication": "Aplicação Pluggy",
+    "pluggyApplicationHint": "Escolha a qual aplicação Pluggy esta conexão bancária pertence.",
+    "pluggyApplicationNone": "Sem aplicação vinculada",
+    "providerStatus": "Status na Pluggy: {{status}} ({{execution}})",
+    "consentExpires": "O consentimento do banco expira em {{date}}"
   },
   "settings": {
     "rules": "Regras",
@@ -1456,7 +1562,84 @@
     "autoGenerate": "Gerar transações automaticamente",
     "autoGenerateHelp": "Cria uma transação sempre que esta conta vence. Desative para aguardar o lançamento real (por exemplo, da sincronização bancária) e mostrá-la apenas como prevista até lá.",
     "fxEstimate": "Estimativa baseada na última taxa de câmbio ({{rate}}). O valor final pode mudar.",
-    "confirmDeleteDescription": "A definição recorrente \"{{description}}\" será excluída permanentemente. As transações existentes permanecerão, mas perderão o vínculo recorrente. Esta ação não pode ser desfeita."
+    "confirmDeleteDescription": "A definição recorrente \"{{description}}\" será excluída permanentemente. As transações existentes permanecerão, mas perderão o vínculo recorrente. Esta ação não pode ser desfeita.",
+    "weekly_billed_monthly": "Semanal, cobrado mensalmente",
+    "decisionSaved": "Vínculo de recorrência atualizado",
+    "linkedUnknown": "Cobrança recorrente",
+    "link": {
+      "auto": "Vinculada automaticamente",
+      "conflict": "Precisa de revisão",
+      "manual": "Vinculada por você"
+    },
+    "companion": "Imposto desta cobrança (IOF)",
+    "markedNotRecurring": "Marcada como não recorrente",
+    "notLinked": "Não vinculada a uma cobrança recorrente",
+    "issue": {
+      "amount_changed": "Cobrado {{charged}}, esperado {{expected}}: o valor mudou.",
+      "double_charge": "Outra cobrança já cobre este período: possível cobrança em dobro."
+    },
+    "confirmAmount": "Confirmar novo valor",
+    "confirmHint": "O novo valor passa a ser o valor esperado daqui em diante",
+    "accept": "Aceitar",
+    "acceptHint": "Manter vinculada sem alterar o valor esperado",
+    "reject": "Não é desta recorrência",
+    "undoDecision": "Desfazer",
+    "makeRecurring": "Tornar recorrente",
+    "notRecurring": "Não é recorrente",
+    "linkTo": "Vincular a…",
+    "slot": {
+      "posted": "Lançada",
+      "conflict": "Precisa de revisão",
+      "expected": "Prevista",
+      "late": "Atrasada",
+      "missed": "Não veio",
+      "skipped": "Não vai acontecer"
+    },
+    "linkedCount_one": "{{count}} cobrança vinculada",
+    "linkedCount_other": "{{count}} cobranças vinculadas",
+    "ended": "Recorrência encerrada",
+    "conflicts_one": "{{count}} para revisar",
+    "conflicts_other": "{{count}} para revisar",
+    "suggestEnd_one": "Não veio no último período. Foi encerrada?",
+    "suggestEnd_other": "Não veio nos últimos {{count}} períodos. Foi encerrada?",
+    "end": "Encerrar",
+    "suggestions": {
+      "title": "Cobranças recorrentes sugeridas",
+      "about": "cerca de",
+      "seen_one": "vista em {{count}} período, a última em {{last}}",
+      "seen_other": "vista em {{count}} períodos, a última em {{last}}",
+      "create": "Criar",
+      "dismiss": "Dispensar",
+      "empty": "Nenhuma sugestão para esta conta"
+    },
+    "amountPerWeek": "Valor por semana",
+    "billingDay": "Dia da cobrança",
+    "billingWeekday": "Dia da semana do serviço",
+    "weekCountBasis": "Semanas contadas no",
+    "basisPreviousMonth": "Mês anterior",
+    "basisSameMonth": "Mês da cobrança",
+    "weeklyPreview": "{{month}}: {{units}} × {{amount}} = {{total}}",
+    "amountMode": "Valor",
+    "amountFixed": "Fixo",
+    "amountVariable": "Variável",
+    "tolerance": "Tolerância (%)",
+    "dayWindow": "Janela de dias (± dias)",
+    "dayWindowAuto": "Automática",
+    "matchCondition": "Quais cobranças pertencem a ela",
+    "matchConditionHint": "Condições na linguagem das regras. Deixe vazio para reconhecer pela descrição e valor.",
+    "skip": {
+      "action": "Não vai acontecer",
+      "undo": "Vai acontecer",
+      "hint": "Os relatórios contam toda ocorrência que ainda vai acontecer. Marque esta se ela não aconteceu ou não vai acontecer.",
+      "undoHint": "Marcada como não acontecendo: os relatórios a desconsideram.",
+      "done": "Ocorrência desconsiderada dos relatórios",
+      "undone": "Ocorrência voltou a contar"
+    },
+    "extraAccounts": "Também pode sair de",
+    "extraAccountsHint": "Cada mês é pago inteiro por uma destas contas ou pela conta acima. A previsão fica na conta acima.",
+    "accountsCount_one": "{{count}} conta",
+    "accountsCount_other": "{{count}} contas",
+    "paidFrom": "pago por {{account}}"
   },
   "rules": {
     "searchPlaceholder": "Buscar regras...",
@@ -1577,6 +1760,76 @@
       "rules": "Regras",
       "queue": "Esperando você",
       "history": "Histórico"
+    },
+    "fieldDescriptionKey": "Descrição (só letras)",
+    "fieldOriginalDescription": "Descrição original",
+    "fieldProviderDescriptionRaw": "Descrição bruta do banco",
+    "fieldMerchant": "Estabelecimento",
+    "fieldSignedAmount": "Valor com sinal (− saída, + entrada)",
+    "fieldCurrency": "Moeda",
+    "fieldOperationType": "Tipo de operação (banco)",
+    "fieldProviderCategory": "Categoria do banco",
+    "fieldAccountKind": "Tipo de conta",
+    "fieldCardNumber": "Final do cartão",
+    "fieldInstallmentNumber": "Nº da parcela",
+    "fieldTotalInstallments": "Total de parcelas",
+    "fieldPaymentType": "Forma de pagamento",
+    "paymentSingle": "À vista",
+    "paymentInstallment": "Parcelado",
+    "opNotRegex": "não casa com a regex",
+    "opIn": "é um de",
+    "opNotIn": "não é nenhum de",
+    "opIsEmpty": "está vazio",
+    "opIsNotEmpty": "não está vazio",
+    "notOp": "NÃO",
+    "notGroup": "Nada disto (NÃO)",
+    "removeNot": "Remover NÃO",
+    "negateHint": "Negar: casa quando isto não casa",
+    "listValuePlaceholder": "Valores separados por vírgula",
+    "field": "Campo",
+    "operator": "Operador",
+    "tooDeep": "As condições podem ter no máximo {{max}} níveis.",
+    "scope": "Vale para",
+    "scopeAll": "Todas as contas",
+    "scopeBank": "Contas bancárias",
+    "scopeCard": "Cartões de crédito",
+    "scopeOneAccount": "Uma conta",
+    "scopeHint": "Campos e ações exclusivos de cartão aparecem quando a regra vale só para cartões.",
+    "clearCategory": "Tirar categoria",
+    "clearCategoryHint": "Remove a categoria",
+    "setCardLineKind": "Tipo de linha do cartão",
+    "stripInstallmentMarker": "Remover marcador de parcela",
+    "stripPatternPlaceholder": "Expressão regular (só para agrupar parcelas)",
+    "cardKind": {
+      "purchase": "Compra",
+      "credit": "Crédito",
+      "payment": "Pagamento de fatura",
+      "previous_balance": "Saldo anterior"
+    },
+    "overwriteManualChoices": "Também substituir categorias que escolhi à mão",
+    "builtin": "Embutida",
+    "skippedBecause": "Ignorada:",
+    "restoreDefaults": "Restaurar padrões",
+    "restoreDefaultsHint": "Recria as regras embutidas excluídas e desfaz edições nelas",
+    "defaultsRestored": "Regras embutidas restauradas",
+    "errors": {
+      "invalid_condition": "condição inválida",
+      "invalid_action": "ação inválida",
+      "invalid_scope": "escopo inválido",
+      "invalid_group_op": "um grupo deve usar E ou OU",
+      "empty_group": "grupo vazio",
+      "too_deep": "aninhamento demais (máx. {{max}})",
+      "field_not_in_scope": "o campo \"{{field}}\" só existe em cartões",
+      "action_not_in_scope": "esta ação só vale para cartões",
+      "op_not_for_field": "operador inválido para \"{{field}}\"",
+      "unexpected_value": "\"{{op}}\" não leva valor",
+      "missing_value": "falta o valor de \"{{field}}\"",
+      "invalid_value": "valor inválido para \"{{field}}\"",
+      "invalid_regex": "expressão regular inválida",
+      "invalid_card_kind": "tipo de linha de cartão inválido",
+      "blank_description": "a descrição está em branco",
+      "long_description": "a descrição é longa demais",
+      "category_missing": "a categoria dela não existe mais"
     }
   },
   "categories": {
@@ -1993,7 +2246,13 @@
     "range30d": "30D",
     "customRange": "Período personalizado",
     "pickCustomRange": "Escolha uma data inicial e final",
-    "loadError": "Falha ao carregar o relatório"
+    "loadError": "Falha ao carregar o relatório",
+    "cardBills": "Faturas {{name}}",
+    "cashFlowScope": "Dinheiro em conta · cartões saem no vencimento de cada fatura",
+    "referenceDate": "Data de referência",
+    "period": "Período",
+    "periodBefore": "Meses antes",
+    "periodAfter": "Meses depois"
   },
   "payees": {
     "noPayeeFound": "Nenhuma pessoa encontrada.",
@@ -2392,6 +2651,29 @@
       "timezoneServerDefault": "Padrão do servidor ({{zone}})",
       "timezoneSavedInvalid": "O valor salvo {{value}} não é um fuso horário que este servidor conhece. {{zone}} está em uso até que ele seja alterado.",
       "updated": "Configuração atualizada"
+    },
+    "pluggy": {
+      "title": "Aplicações Pluggy",
+      "subtitle": "Client ID e secret de cada aplicação Pluggy (dashboard.pluggy.ai). Cada conexão Pluggy usa a aplicação com que foi criada.",
+      "add": "Adicionar aplicação",
+      "addTitle": "Adicionar aplicação Pluggy",
+      "editTitle": "Editar aplicação Pluggy",
+      "dialogDesc": "As chaves ficam cifradas e não são exibidas de novo. Elas não são testadas agora: uma chave errada aparece na primeira sincronização.",
+      "name": "Nome",
+      "clientId": "Client ID",
+      "clientSecret": "Client secret",
+      "keepBlank": "Deixe em branco para manter o valor atual.",
+      "connections_one": "{{count}} conexão",
+      "connections_other": "{{count}} conexões",
+      "lastError": "Último erro: {{error}}",
+      "empty": "Nenhuma aplicação Pluggy ainda. Adicione uma para conectar bancos brasileiros.",
+      "notConfigured": "A Pluggy não está configurada.",
+      "saved": "Aplicação Pluggy salva",
+      "deleted": "Aplicação Pluggy excluída",
+      "deleteTitle": "Excluir aplicação Pluggy",
+      "deleteConfirm": "Excluir \"{{name}}\"? As chaves dela serão removidas do Securo.",
+      "deleteBlocked_one": "Ela é usada por {{count}} conexão. Remova essa conexão primeiro.",
+      "deleteBlocked_other": "Ela é usada por {{count}} conexões. Remova essas conexões primeiro."
     }
   },
   "onboarding": {
@@ -2870,6 +3152,45 @@
       "invoicesHint": "Como decidimos qual pagamento quita qual fatura.",
       "recurring": "Regras de Recorrentes",
       "recurringHint": "Como decidimos que uma cobrança é a conta que você já esperava."
+    }
+  },
+  "installments": {
+    "title": "Parcelamentos",
+    "empty": "Nenhuma compra parcelada neste cartão.",
+    "alerts": "{{conflicts}} parcela(s) fora da sequência · {{missing}} parcela(s) que o banco não enviou",
+    "unnamed": "Compra parcelada",
+    "summary": "{{current}}/{{total}} × {{amount}} · total {{total_amount}}",
+    "remaining": "{{amount}} a vir",
+    "source": {
+      "manual": "agrupado por você",
+      "series": "criado no Securo",
+      "detected": "detectado"
+    },
+    "merge": "Juntar",
+    "mergeInto": "Juntar com:",
+    "noMergeTarget": "Nenhuma compra compatível (mesmo nº de parcelas, sem parcela repetida).",
+    "confirm": "Confirmar",
+    "split": "Compra própria",
+    "undo": "Desfazer",
+    "moveTo": "Mover para a compra…",
+    "manualLink": "ligado por você",
+    "pending": "pendente",
+    "saved": "Parcelamentos atualizados",
+    "conflictBadge": "Fora da sequência: confira o parcelamento",
+    "kind": {
+      "posted": "recebida",
+      "projected": "prevista",
+      "missing": "não enviada pelo banco",
+      "before_history": "anterior ao histórico sincronizado"
+    },
+    "link": {
+      "auto": "agrupada automaticamente",
+      "conflict": "não encaixa na compra",
+      "manual": "agrupada por você"
+    },
+    "issue": {
+      "month": "Esperada na fatura de {{expected}}",
+      "amount": "Valor esperado ~{{expected}}"
     }
   }
 }

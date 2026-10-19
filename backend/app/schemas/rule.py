@@ -1,41 +1,59 @@
 # backend/app/schemas/rule.py
 import datetime
 import uuid
-from typing import Any, Optional, Union
+from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+_VALUELESS_OPS = {"is_empty", "is_not_empty"}
+_LIST_OPS = {"in", "not_in"}
+
+
+def _blank(v: Any) -> bool:
+    return v is None or (isinstance(v, str) and not v.strip())
 
 
 class RuleCondition(BaseModel):
-    field: str   # description, payee, notes, amount, type, account_id, payee_id, date, status
-    op: str      # contains, not_contains, equals, not_equals, starts_with, ends_with, regex, gt, gte, lt, lte
-    value: Any   # str or number depending on field
+    field: str   # see rule_engine.FIELD_TYPES
+    op: str      # see rule_engine.allowed_ops
+    value: Any = None  # str/number, a list for in/not_in, absent for is_empty/is_not_empty
 
-    @field_validator("value")
-    @classmethod
-    def value_must_not_be_blank(cls, v: Any) -> Any:
+    @model_validator(mode="after")
+    def value_matches_operator(self) -> "RuleCondition":
         """Reject blank values — they silently match every transaction.
 
         A blank value turns `contains`/`starts_with`/`ends_with`/`regex` into a
         tautology, and numeric comparisons fall back to 0, so the rule applies
         its actions to the whole ledger. Explicit `0` and `False` stay valid.
+        Value-less operators (is_empty / is_not_empty) must not carry one.
         """
-        if v is None or (isinstance(v, str) and not v.strip()):
+        v = self.value
+        if self.op in _VALUELESS_OPS:
+            if not _blank(v) and v != []:
+                raise ValueError(f"Operator '{self.op}' takes no value")
+            self.value = None
+            return self
+        if self.op in _LIST_OPS:
+            items = v if isinstance(v, list) else [v]
+            if not items or any(_blank(x) for x in items):
+                raise ValueError("Condition value cannot be blank")
+            return self
+        if _blank(v):
             raise ValueError("Condition value cannot be blank")
-        return v
+        return self
 
 
 class RuleConditionGroup(BaseModel):
     """A nested group of conditions joined by its own operator.
 
     Groups let a rule mix AND and OR — `type is debit AND (contains UBER OR
-    contains 99POP)`. They hold leaf conditions only: `conditions` is typed as
-    `list[RuleCondition]`, so a nested group fails validation and rule depth
-    stays capped at two levels, which is what the engine and editor support.
+    contains 99POP)` — and nest to any depth up to 5 (Rules v2; the engine
+    enforces the limit), alongside negations.
     """
 
     op: str = "or"   # and, or
-    conditions: list[RuleCondition]
+    conditions: list["RuleConditionNode"]
 
     @field_validator("op")
     @classmethod
@@ -46,22 +64,46 @@ class RuleConditionGroup(BaseModel):
 
     @field_validator("conditions")
     @classmethod
-    def group_must_not_be_empty(cls, v: list[RuleCondition]) -> list[RuleCondition]:
+    def group_must_not_be_empty(cls, v: list) -> list:
         """An empty group never matches, so it can only make a rule confusing."""
         if not v:
             raise ValueError("Condition group cannot be empty")
         return v
 
 
-# A rule's condition list mixes leaves and one level of groups. The two shapes
-# are disjoint — a leaf has no `conditions`, a group has no `field`/`value` — so
-# Pydantic's smart union resolves them without a discriminator.
-RuleConditionNode = Union[RuleConditionGroup, RuleCondition]
+class RuleConditionNot(BaseModel):
+    """`{"not": node}` — matches when the node does not."""
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
+    not_: "RuleConditionNode" = Field(alias="not")
+
+
+# A condition node is a leaf, a group or a negation. The shapes are disjoint —
+# a leaf has `field`, a group `conditions`, a negation `not` — so Pydantic's
+# smart union resolves them without a discriminator.
+RuleConditionNode = Union[RuleConditionGroup, RuleConditionNot, RuleCondition]
+RuleConditionGroup.model_rebuild()
+RuleConditionNot.model_rebuild()
+
+
+def dump_conditions(conditions: list) -> list[dict]:
+    """Stored JSON of a validated condition list (negations as `{"not": …}`)."""
+    return [
+        c.model_dump(by_alias=True) if hasattr(c, "model_dump") else c
+        for c in conditions or []
+    ]
 
 
 class RuleAction(BaseModel):
-    op: str      # set_category, set_payee, set_description, append_notes, ignore
-    value: Any   # entity UUID or text depending on action
+    # set_category, clear_category, set_payee, set_description, append_notes,
+    # ignore, set_card_line_kind (credit cards), strip_installment_marker
+    # (credit cards)
+    op: str
+    value: Any = None   # entity UUID, text, card line kind or pattern; none for clear_category/ignore
+
+
+ScopeKind = Optional[Literal["bank", "credit_card"]]
 
 
 class RuleCreate(BaseModel):
@@ -71,7 +113,10 @@ class RuleCreate(BaseModel):
     actions: list[RuleAction]
     priority: int = 0
     is_active: bool = True
+    scope_account_kind: ScopeKind = None
+    scope_account_id: Optional[uuid.UUID] = None
     apply_to_existing: bool = True
+    # "Also override manual choices": rules replace categories the user set by hand.
     overwrite_existing_categories: bool = False
 
 
@@ -82,8 +127,18 @@ class RuleUpdate(BaseModel):
     actions: Optional[list[RuleAction]] = None
     priority: Optional[int] = None
     is_active: Optional[bool] = None
+    scope_account_kind: ScopeKind = None
+    scope_account_id: Optional[uuid.UUID] = None
     apply_to_existing: Optional[bool] = None
     overwrite_existing_categories: bool = False
+
+
+class RuleError(BaseModel):
+    """A problem that makes the engine skip the rule (shown, not hidden)."""
+
+    code: str
+    message: str
+    params: dict = {}
 
 
 class RuleRead(BaseModel):
@@ -95,6 +150,11 @@ class RuleRead(BaseModel):
     actions: list[dict]
     priority: int
     is_active: bool
+    scope_account_kind: Optional[str] = None
+    scope_account_id: Optional[uuid.UUID] = None
+    is_builtin: bool = False
+    builtin_key: Optional[str] = None
+    errors: list[RuleError] = []
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -116,11 +176,16 @@ class RuleExportItem(BaseModel):
     actions: list[RuleAction]
     priority: int = 0
     is_active: bool = True
+    # v2 (version 1 files simply lack them).
+    scope_account_kind: ScopeKind = None
+    builtin_key: Optional[str] = None
 
 
 class RuleExportPayload(BaseModel):
     format: str = "securo-categorization-rules"
-    version: int = 1
+    # 2 = Rules v2 (scope, nested/negated conditions, new fields/actions).
+    # Version 1 files are still read.
+    version: int = 2
     rules: list[RuleExportItem]
 
 
@@ -148,6 +213,8 @@ class RulePreviewRequest(BaseModel):
     conditions: list[RuleConditionNode]
     actions: list[RuleAction] = []
     is_active: bool = True
+    scope_account_kind: ScopeKind = None
+    scope_account_id: Optional[uuid.UUID] = None
     apply_to_existing: bool = True
     overwrite_existing_categories: bool = False
     limit: int = Field(default=20, ge=1, le=100)

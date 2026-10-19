@@ -16,9 +16,10 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { Category, Payee, Rule, RuleAction, RuleCondition, RuleConditionNode, RuleExportPayload } from '@/types'
-import { isConditionGroup } from '@/lib/rule-conditions'
+import { isConditionGroup, isConditionNot } from '@/lib/rule-conditions'
+import { VALUELESS_OPS, fieldDef, opsForField } from '@/lib/rule-fields'
 import { normalizeRuleMatchValue, ruleSearchText } from '@/lib/rule-match-utils'
-import { Trash2, Plus, RefreshCw, Package, Check, ArrowUpDown, ArrowUp, ArrowDown, Download, Upload, Search, Power } from 'lucide-react'
+import { Trash2, Plus, RefreshCw, Package, Check, ArrowUpDown, ArrowUp, ArrowDown, Download, Upload, Search, Power, AlertTriangle, RotateCcw } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { PageHeader } from '@/components/page-header'
 import { useWorkspace } from '@/contexts/workspace-context'
@@ -62,81 +63,44 @@ function SectionHeader({
   )
 }
 
-const CONDITION_FIELDS = [
-  { value: 'description', label: 'rules.fieldDescription' },
-  { value: 'payee', label: 'rules.fieldRawPayee' },
-  { value: 'notes', label: 'rules.fieldNotes' },
-  { value: 'amount', label: 'rules.fieldAmount' },
-  { value: 'type', label: 'rules.fieldType' },
-  { value: 'account_id', label: 'rules.fieldAccount' },
-  { value: 'payee_id', label: 'rules.fieldPayee' },
-  { value: 'date', label: 'rules.fieldDate' },
-  { value: 'status', label: 'rules.fieldStatus' },
-] as const
-
-const STRING_OPS = [
-  { value: 'contains', label: 'rules.opContains' },
-  { value: 'not_contains', label: 'rules.opNotContains' },
-  { value: 'equals', label: 'rules.opEquals' },
-  { value: 'not_equals', label: 'rules.opNotEquals' },
-  { value: 'starts_with', label: 'rules.opStartsWith' },
-  { value: 'ends_with', label: 'rules.opEndsWith' },
-  { value: 'regex', label: 'rules.opRegex' },
-]
-
-const NUMERIC_OPS = [
-  { value: 'equals', label: '=' },
-  { value: 'gt', label: '>' },
-  { value: 'gte', label: '>=' },
-  { value: 'lt', label: '<' },
-  { value: 'lte', label: '<=' },
-]
-
-function getOpsForField(field: string) {
-  if (field === 'amount' || field === 'date') return NUMERIC_OPS
-  if (field === 'type') return [{ value: 'equals', label: 'rules.opIs' }]
-  if (field === 'payee_id' || field === 'account_id' || field === 'status') return [
-    { value: 'equals', label: 'rules.opIs' },
-    { value: 'not_equals', label: 'rules.opIsNot' },
-  ]
-  return STRING_OPS
-}
-
 function conditionSummary(conditions: RuleConditionNode[], conditionsOp: string, t: (key: string) => string, payeesList: Payee[]): string {
   const fieldLabel = (f: string) => {
-    const key = CONDITION_FIELDS.find(x => x.value === f)?.label
+    const key = fieldDef(f)?.label
     return key ? t(key) : f
   }
   const opLabel = (f: string, op: string) => {
-    const key = getOpsForField(f).find(x => x.value === op)?.label
+    const key = opsForField(f).find(x => x.value === op)?.label
     return key ? t(key) : op
   }
-  const valueLabel = (c: RuleCondition) => {
+  const valueLabel = (c: RuleCondition): string => {
+    if (Array.isArray(c.value)) return c.value.join(', ')
     if (c.field === 'payee_id') {
       const p = payeesList.find(p => p.id === c.value)
       return p ? p.name : String(c.value)
     }
-    if (c.field === 'status') {
-      if (c.value === 'pending') return t('rules.statusPending')
-      if (c.value === 'posted') return t('rules.statusPosted')
-    }
-    return String(c.value)
+    const option = fieldDef(c.field)?.options?.find(o => o.value === c.value)
+    if (option && option.label.startsWith('rules.')) return t(option.label)
+    return String(c.value ?? '')
   }
-  const leafSummary = (c: RuleCondition) => `${fieldLabel(c.field)} ${opLabel(c.field, c.op)} "${valueLabel(c)}"`
+  const leafSummary = (c: RuleCondition) => (
+    VALUELESS_OPS.has(c.op)
+      ? `${fieldLabel(c.field)} ${opLabel(c.field, c.op)}`
+      : `${fieldLabel(c.field)} ${opLabel(c.field, c.op)} "${valueLabel(c)}"`
+  )
   const joiner = (op: string) => ` ${op === 'or' ? t('rules.orOp') : t('rules.andOp')} `
   // Groups get parentheses so a mixed AND/OR rule reads unambiguously.
-  const parts = conditions.map(node => (
-    isConditionGroup(node)
-      ? `(${node.conditions.map(leafSummary).join(joiner(node.op))})`
-      : leafSummary(node)
-  ))
-  return parts.join(joiner(conditionsOp)) || t('rules.noConditions')
+  const nodeSummary = (node: RuleConditionNode): string => {
+    if (isConditionGroup(node)) return `(${node.conditions.map(nodeSummary).join(joiner(node.op))})`
+    if (isConditionNot(node)) return `${t('rules.notOp')} ${nodeSummary(node.not)}`
+    return leafSummary(node)
+  }
+  return conditions.map(nodeSummary).join(joiner(conditionsOp)) || t('rules.noConditions')
 }
 
 function actionSummary(actions: RuleAction[], categories: Category[], payeesList: Payee[], t: (key: string) => string): string {
   return actions.map(a => {
     if (a.op === 'set_category') {
-      const cat = findCategoryReference(categories, a.value)
+      const cat = findCategoryReference(categories, a.value ?? '')
       return cat ? `→ ${cat.name}` : `→ ${t('transactions.category')}`
     }
     if (a.op === 'set_payee') {
@@ -148,6 +112,9 @@ function actionSummary(actions: RuleAction[], categories: Category[], payeesList
     }
     if (a.op === 'append_notes') return `→ ${t('rules.fieldNotes')}: ${a.value}`
     if (a.op === 'ignore') return `→ ${t('rules.ignoreAction')}`
+    if (a.op === 'clear_category') return `→ ${t('rules.clearCategory')}`
+    if (a.op === 'set_card_line_kind') return `→ ${t(`rules.cardKind.${a.value}`)}`
+    if (a.op === 'strip_installment_marker') return `→ ${t('rules.stripInstallmentMarker')}`
     return a.op
   }).join('  ') || t('rules.noActions')
 }
@@ -642,6 +609,18 @@ export default function RulesPage() {
                       <span className="text-[10px] font-semibold bg-muted text-muted-foreground px-1.5 py-0 rounded-full">
                         p:{rule.priority}
                       </span>
+                      {(rule.scope_account_kind || rule.scope_account_id) && (
+                        <span className="text-[10px] font-semibold bg-sky-500/10 text-sky-700 dark:text-sky-300 px-1.5 py-0 rounded-full">
+                          {rule.scope_account_id
+                            ? (accountsList?.find(a => a.id === rule.scope_account_id)?.name ?? t('rules.scopeOneAccount'))
+                            : rule.scope_account_kind === 'credit_card' ? t('rules.scopeCard') : t('rules.scopeBank')}
+                        </span>
+                      )}
+                      {rule.is_builtin && (
+                        <span className="text-[10px] font-semibold bg-violet-500/10 text-violet-700 dark:text-violet-300 px-1.5 py-0 rounded-full">
+                          {t('rules.builtin')}
+                        </span>
+                      )}
                     </div>
                     <p className="text-xs text-muted-foreground font-mono truncate">
                       {conditionSummary(rule.conditions, rule.conditions_op, t, payees)}
@@ -649,6 +628,17 @@ export default function RulesPage() {
                     <p className="text-xs text-emerald-600 font-medium mt-0.5">
                       {actionSummary(rule.actions, displayCategories, payees, t)}
                     </p>
+                    {!!rule.errors?.length && (
+                      <div className="mt-1 flex items-start gap-1 text-xs text-amber-700 dark:text-amber-400">
+                        <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                        <span>
+                          {t('rules.skippedBecause')}{' '}
+                          {rule.errors
+                            .map(e => t(`rules.errors.${e.code}`, { ...(e.params ?? {}), defaultValue: e.message }))
+                            .join(' · ')}
+                        </span>
+                      </div>
+                    )}
                   </div>
                   {canWrite && (
                     <div className="flex items-center gap-1 shrink-0">
@@ -782,6 +772,17 @@ function RulePacksDialog({ open, onClose }: { open: boolean; onClose: () => void
     enabled: open,
   })
 
+  const restorePackMutation = useMutation({
+    mutationFn: (code: string) => rulesApi.restorePack(code),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['rules'] })
+      queryClient.invalidateQueries({ queryKey: ['rule-packs'] })
+      invalidateFinancialQueries(queryClient)
+      toast.success(t('rules.defaultsRestored'))
+    },
+    onError: () => toast.error(t('common.error')),
+  })
+
   const installPackMutation = useMutation({
     mutationFn: (code: string) => rulesApi.installPack(code, createMissingCategories),
     onSuccess: (data) => {
@@ -844,6 +845,19 @@ function RulePacksDialog({ open, onClose }: { open: boolean; onClose: () => void
                   {t('rules.packRuleCount', { count: pack.rule_count })}
                 </p>
               </div>
+              {pack.builtin && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="gap-1.5 h-7 text-xs"
+                  onClick={() => restorePackMutation.mutate(pack.code)}
+                  disabled={restorePackMutation.isPending}
+                  title={t('rules.restoreDefaultsHint')}
+                >
+                  <RotateCcw size={11} />
+                  {t('rules.restoreDefaults')}
+                </Button>
+              )}
               {pack.installed ? (
                 <span className="flex items-center gap-1 text-xs font-medium text-emerald-600">
                   <Check size={14} />

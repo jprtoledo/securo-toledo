@@ -3,7 +3,8 @@ import hashlib
 import json
 import logging
 import time
-from datetime import date
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
@@ -18,6 +19,7 @@ from app.providers.base import (
     ConnectionData,
     ConnectTokenData,
     HoldingData,
+    ProviderNotConfiguredError,
     RefreshOutcome,
     TransactionData,
     mask_last4,
@@ -255,6 +257,41 @@ def _date_or_none(value) -> Optional[date]:
         return None
 
 
+def _datetime_or_none(value) -> Optional[datetime]:
+    """Parse a Pluggy ISO timestamp (``2026-10-15T12:00:00.000Z``) as an
+    aware datetime; a bare date becomes midnight UTC."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _year_month_or_none(value) -> Optional[date]:
+    """``2026-10`` / ``2026-10-15`` → first day of that month."""
+    if not value:
+        return None
+    text = str(value)
+    try:
+        return date(int(text[0:4]), int(text[5:7]), 1)
+    except (ValueError, IndexError):
+        return None
+
+
+def _str_or_none(value, limit: int) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:limit] if text else None
+
+
 # Fields from Pluggy /investments we promote to HoldingData top-level.
 # Everything else is preserved verbatim in `metadata` so we don't lose
 # information we might want later (status, rates, issuer, institution,
@@ -324,6 +361,16 @@ def _build_bill_data(raw: dict) -> Optional[BillData]:
     if not bill_id or due_date is None or total_amount is None:
         return None
 
+    charges = raw.get("financeCharges")
+    charges_total: Optional[Decimal] = None
+    if isinstance(charges, list):
+        charges_total = sum(
+            (_decimal_or_none(c.get("amount")) or Decimal("0"))
+            for c in charges
+            if isinstance(c, dict)
+        )
+    payments = raw.get("payments")
+    allows = raw.get("allowsInstallments")
     return BillData(
         external_id=str(bill_id),
         due_date=due_date,
@@ -331,6 +378,10 @@ def _build_bill_data(raw: dict) -> Optional[BillData]:
         currency=raw.get("totalAmountCurrencyCode") or "BRL",
         minimum_payment=_decimal_or_none(raw.get("minimumPaymentAmount")),
         raw_data=raw,
+        closing_date=_date_or_none(raw.get("closingDate") or raw.get("billClosingDate")),
+        allows_installments=allows if isinstance(allows, bool) else None,
+        payments=payments if isinstance(payments, list) else None,
+        finance_charges_total=charges_total,
     )
 
 
@@ -362,12 +413,19 @@ def _build_account_data(acc: dict, type_mapper) -> AccountData:
             credit_data, acc.get("balance"), acc.get("currencyCode") or "USD"
         )
 
+    bank_data = acc.get("bankData") or {}
     return AccountData(
         external_id=acc["id"],
         name=acc["name"],
         type=account_type,
         balance=Decimal(str(acc.get("balance", 0))),
         currency=acc.get("currencyCode", "USD"),
+        available_credit_limit=_decimal_or_none(credit_data.get("availableCreditLimit")),
+        balance_close_date=_date_or_none(credit_data.get("balanceCloseDate")),
+        balance_due_date=_date_or_none(credit_data.get("balanceDueDate")),
+        card_holder_type=_str_or_none(credit_data.get("holderType"), 30),
+        overdraft_limit=_decimal_or_none(bank_data.get("overdraftContractedLimit")),
+        overdraft_used=_decimal_or_none(bank_data.get("overdraftUsedLimit")),
         credit_limit=credit_limit,
         statement_close_day=statement_close_day,
         payment_due_day=payment_due_day,
@@ -381,6 +439,28 @@ def _build_account_data(acc: dict, type_mapper) -> AccountData:
     )
 
 
+@dataclass(frozen=True)
+class PluggyKeys:
+    """Decrypted keys of one Pluggy application (credential).
+
+    ``version`` changes whenever the stored credential changes (its
+    ``updated_at``), which invalidates the cached API key for it.
+    """
+
+    credential_id: str
+    client_id: str
+    client_secret: str
+    version: str = ""
+
+
+class PluggyAuthError(RuntimeError):
+    """Pluggy refused a credential's client id/secret on /auth."""
+
+    def __init__(self, message: str, *, credential_id: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.credential_id = credential_id
+
+
 class PluggyProvider(BankProvider):
     """Pluggy (MeuPluggy) open finance provider.
 
@@ -388,10 +468,16 @@ class PluggyProvider(BankProvider):
     1. Backend creates a connect token for the frontend widget
     2. Widget handles bank selection, login, and MFA
     3. Widget returns an Item ID which is used as the connection identifier
+
+    Every instance is bound to one Pluggy application (``PluggyKeys``):
+    an Item is only readable by the application that created it.
     """
 
-    _api_key: Optional[str] = None
-    _api_key_expires_at: float = 0
+    # API keys per credential id: (credential version, api key, expires at).
+    _api_keys: dict[str, tuple[str, str, float]] = {}
+
+    def __init__(self, credential: Optional[PluggyKeys] = None) -> None:
+        self.credential = credential
 
     @property
     def name(self) -> str:
@@ -401,28 +487,50 @@ class PluggyProvider(BankProvider):
     def flow_type(self) -> str:
         return "widget"
 
-    async def _ensure_api_key(self) -> str:
-        """Get a valid API key, refreshing if expired or about to expire (<5min remaining)."""
-        now = time.time()
-        if self._api_key and (self._api_key_expires_at - now) > 300:
-            return self._api_key
+    @classmethod
+    def invalidate_api_key(cls, credential_id) -> None:
+        cls._api_keys.pop(str(credential_id), None)
 
-        settings = get_settings()
+    async def _ensure_api_key(self) -> str:
+        """Get a valid API key for the bound credential, refreshing it when
+        expired or about to expire (<5min remaining)."""
+        credential = self.credential
+        if credential is None:
+            raise ProviderNotConfiguredError(
+                "This Pluggy connection is not bound to a Pluggy application. "
+                "An administrator must add one in the Admin page."
+            )
+        now = time.time()
+        cached = PluggyProvider._api_keys.get(credential.credential_id)
+        if cached and cached[0] == credential.version and (cached[2] - now) > 300:
+            return cached[1]
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{PLUGGY_API_BASE}/auth",
                 json={
-                    "clientId": settings.pluggy_client_id,
-                    "clientSecret": settings.pluggy_client_secret.get_secret_value(),
+                    "clientId": credential.client_id,
+                    "clientSecret": credential.client_secret,
                 },
             )
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                detail = ""
+                try:
+                    body = resp.json()
+                    detail = str(body.get("message") or body.get("codeDescription") or "")
+                except ValueError:
+                    detail = resp.text[:200]
+                raise PluggyAuthError(
+                    f"Pluggy rejected the credential ({resp.status_code}): {detail}".rstrip(": "),
+                    credential_id=credential.credential_id,
+                )
             data = resp.json()
 
-        PluggyProvider._api_key = data["apiKey"]
         # Pluggy API keys last 2 hours
-        PluggyProvider._api_key_expires_at = now + 7200
-        return PluggyProvider._api_key
+        PluggyProvider._api_keys[credential.credential_id] = (
+            credential.version, data["apiKey"], now + 7200,
+        )
+        return data["apiKey"]
 
     async def _headers(self) -> dict:
         api_key = await self._ensure_api_key()
@@ -542,6 +650,34 @@ class PluggyProvider(BankProvider):
         self, credentials: dict, account_external_id: str,
         since: Optional[date] = None, payee_source: str = "auto",
     ) -> list[TransactionData]:
+        # Filter by Pluggy ingestion time, NOT transaction date: `dateFrom`
+        # silently drops rows Pluggy ingests later but backdates (bill
+        # payments dated to the bill close, merchants that settle weeks
+        # late). The Pluggy sync path combines both sweeps through
+        # get_transactions_filtered.
+        return await self.get_transactions_filtered(
+            credentials,
+            account_external_id,
+            payee_source=payee_source,
+            created_at_from=since.isoformat() if since else None,
+        )
+
+    async def get_transactions_filtered(
+        self,
+        credentials: dict,
+        account_external_id: str,
+        *,
+        payee_source: str = "auto",
+        date_from: Optional[date] = None,
+        created_at_from: Optional[str] = None,
+        ids: Optional[list[str]] = None,
+    ) -> list[TransactionData]:
+        """One sweep of /v2/transactions (RFC toledo-features §4.4).
+
+        ``date_from`` filters on the transaction date, ``created_at_from``
+        (ISO date or timestamp) on Pluggy's ingestion time, ``ids`` (≤ 500)
+        on the transaction ids. No filter = the account's whole history.
+        """
         headers = await self._headers()
         all_transactions: list[TransactionData] = []
         after: Optional[str] = None
@@ -552,18 +688,15 @@ class PluggyProvider(BankProvider):
                 # /transactions — it returns 410 ENDPOINT_DEPRECATED on newer
                 # API keys (rolled out per key). /v2/transactions pages via an
                 # opaque `after` cursor (returned in `next`) instead of
-                # page/pageSize.
+                # page/pageSize — v2 rejects `pageSize` with a 400
+                # ("property pageSize should not exist").
                 params: dict = {"accountId": account_external_id}
-                if since:
-                    # Filter by Pluggy ingestion time, NOT transaction date.
-                    # `dateFrom`/`dateTo` filter on `date` (when the txn
-                    # happened), which silently drops transactions Pluggy
-                    # ingests later but backdates — e.g. credit card bill
-                    # payments dated to the bill close, or merchants that
-                    # settle weeks late. `createdAtFrom` filters on Pluggy's
-                    # row creation time, so any newly-ingested row is fetched
-                    # regardless of date. v2 still supports it.
-                    params["createdAtFrom"] = since.isoformat()
+                if date_from:
+                    params["dateFrom"] = date_from.isoformat()
+                if created_at_from:
+                    params["createdAtFrom"] = created_at_from
+                if ids:
+                    params["ids"] = ",".join(ids)
                 if after:
                     params["after"] = after
 
@@ -580,79 +713,7 @@ class PluggyProvider(BankProvider):
                     break
 
                 for txn in results:
-                    amount_raw = txn.get("amount", 0)
-                    amount = Decimal(str(abs(amount_raw)))
-
-                    # Use Pluggy's explicit type field when available
-                    pluggy_type = txn.get("type", "").upper()
-                    if pluggy_type == "DEBIT":
-                        txn_type = "debit"
-                    elif pluggy_type == "CREDIT":
-                        txn_type = "credit"
-                    else:
-                        txn_type = "credit" if amount_raw >= 0 else "debit"
-
-                    txn_date = date.fromisoformat(txn["date"][:10])
-
-                    # Pending vs booked status
-                    status = "pending" if txn.get("status") == "PENDING" else "posted"
-
-                    # Smart payee extraction (merchant → payment data → None)
-                    payee = self._extract_payee(txn, txn_type, payee_source)
-
-                    # Bank-provided conversion for international transactions
-                    amt_in_acct = txn.get("amountInAccountCurrency")
-                    amount_in_account_currency = (
-                        Decimal(str(abs(amt_in_acct))) if amt_in_acct is not None else None
-                    )
-
-                    # Installment metadata from creditCardMetadata (parcelamento).
-                    # Pluggy reports installment_number, total, original amount and
-                    # purchase date on each charge for CC connectors that support it.
-                    cc_meta = txn.get("creditCardMetadata") or {}
-                    inst_number = cc_meta.get("installmentNumber")
-                    inst_total = cc_meta.get("totalInstallments")
-                    inst_total_amount = cc_meta.get("totalAmount")
-                    inst_purchase_date_raw = cc_meta.get("purchaseDate")
-                    inst_purchase_date: Optional[date] = None
-                    if inst_purchase_date_raw:
-                        try:
-                            inst_purchase_date = date.fromisoformat(str(inst_purchase_date_raw)[:10])
-                        except ValueError:
-                            inst_purchase_date = None
-                    inst_total_amount_dec = (
-                        Decimal(str(abs(inst_total_amount)))
-                        if inst_total_amount is not None
-                        else None
-                    )
-                    # Bill linkage: Pluggy stamps each charge with the id of
-                    # the bill it lands in. The sync layer resolves this to a
-                    # credit_card_bills FK; we just capture the string here.
-                    bill_external_id_raw = cc_meta.get("billId")
-                    bill_external_id = (
-                        str(bill_external_id_raw) if bill_external_id_raw else None
-                    )
-
-                    all_transactions.append(
-                        TransactionData(
-                            external_id=txn["id"],
-                            description=txn.get("description", ""),
-                            amount=amount,
-                            date=txn_date,
-                            type=txn_type,
-                            currency=txn.get("currencyCode"),
-                            amount_in_account_currency=amount_in_account_currency,
-                            pluggy_category=txn.get("category"),
-                            status=status,
-                            payee=payee,
-                            raw_data=txn,
-                            installment_number=inst_number if isinstance(inst_number, int) else None,
-                            total_installments=inst_total if isinstance(inst_total, int) else None,
-                            installment_total_amount=inst_total_amount_dec,
-                            installment_purchase_date=inst_purchase_date,
-                            bill_external_id=bill_external_id,
-                        )
-                    )
+                    all_transactions.append(self._build_transaction_data(txn, payee_source))
 
                 next_after = self._extract_after(data.get("next"))
                 if not next_after or next_after == after:
@@ -660,6 +721,134 @@ class PluggyProvider(BankProvider):
                 after = next_after
 
         return all_transactions
+
+    def _build_transaction_data(self, txn: dict, payee_source: str = "auto") -> TransactionData:
+        """Map one Pluggy transaction payload (all §4.3 fields)."""
+        amount_raw = txn.get("amount", 0)
+        amount = Decimal(str(abs(amount_raw)))
+
+        # Use Pluggy's explicit type field when available
+        pluggy_type = txn.get("type", "").upper()
+        if pluggy_type == "DEBIT":
+            txn_type = "debit"
+        elif pluggy_type == "CREDIT":
+            txn_type = "credit"
+        else:
+            txn_type = "credit" if amount_raw >= 0 else "debit"
+
+        txn_date = date.fromisoformat(txn["date"][:10])
+
+        # Pending vs booked status
+        status = "pending" if txn.get("status") == "PENDING" else "posted"
+
+        # Smart payee extraction (merchant → payment data → None)
+        payee = self._extract_payee(txn, txn_type, payee_source)
+
+        # Bank-provided conversion for international transactions
+        amt_in_acct = txn.get("amountInAccountCurrency")
+        amount_in_account_currency = (
+            Decimal(str(abs(amt_in_acct))) if amt_in_acct is not None else None
+        )
+
+        # Installment metadata from creditCardMetadata (parcelamento).
+        # Pluggy reports installment_number, total, original amount and
+        # purchase date on each charge for CC connectors that support it.
+        cc_meta = txn.get("creditCardMetadata") or {}
+        inst_number = cc_meta.get("installmentNumber")
+        inst_total = cc_meta.get("totalInstallments")
+        inst_total_amount = cc_meta.get("totalAmount")
+        inst_purchase_date_raw = cc_meta.get("purchaseDate")
+        inst_purchase_date: Optional[date] = None
+        if inst_purchase_date_raw:
+            try:
+                inst_purchase_date = date.fromisoformat(str(inst_purchase_date_raw)[:10])
+            except ValueError:
+                inst_purchase_date = None
+        inst_total_amount_dec = (
+            Decimal(str(abs(inst_total_amount)))
+            if inst_total_amount is not None
+            else None
+        )
+        # Bill linkage: Pluggy stamps each charge with the id of
+        # the bill it lands in. The sync layer resolves this to a
+        # credit_card_bills FK; we just capture the string here.
+        bill_external_id_raw = cc_meta.get("billId")
+        bill_external_id = (
+            str(bill_external_id_raw) if bill_external_id_raw else None
+        )
+        # The purchase timestamp, to the second: transactionDateTime when
+        # the bank sends it, else purchaseDate when it carries a time.
+        transaction_at = _datetime_or_none(cc_meta.get("transactionDateTime"))
+        if transaction_at is None and inst_purchase_date_raw and len(str(inst_purchase_date_raw)) > 10:
+            transaction_at = _datetime_or_none(inst_purchase_date_raw)
+
+        merchant = txn.get("merchant") if isinstance(txn.get("merchant"), dict) else {}
+        balance = txn.get("balance")
+        payment_data = txn.get("paymentData")
+
+        return TransactionData(
+            external_id=txn["id"],
+            description=txn.get("description", ""),
+            amount=amount,
+            date=txn_date,
+            type=txn_type,
+            currency=txn.get("currencyCode"),
+            amount_in_account_currency=amount_in_account_currency,
+            pluggy_category=txn.get("category"),
+            status=status,
+            payee=payee,
+            raw_data=txn,
+            installment_number=inst_number if isinstance(inst_number, int) else None,
+            total_installments=inst_total if isinstance(inst_total, int) else None,
+            installment_total_amount=inst_total_amount_dec,
+            installment_purchase_date=inst_purchase_date,
+            bill_external_id=bill_external_id,
+            provider_id=_str_or_none(txn.get("providerId"), 255),
+            provider_code=_str_or_none(txn.get("providerCode"), 255),
+            provider_created_at=_datetime_or_none(txn.get("createdAt")),
+            provider_updated_at=_datetime_or_none(txn.get("updatedAt")),
+            description_raw=_str_or_none(txn.get("descriptionRaw"), 500),
+            operation_type=_str_or_none(txn.get("operationType"), 50),
+            provider_category_id=_str_or_none(txn.get("categoryId"), 50),
+            merchant_name=_str_or_none(merchant.get("businessName") or merchant.get("name"), 255),
+            merchant_cnpj=_str_or_none(merchant.get("cnpj"), 20),
+            merchant_mcc=_str_or_none(cc_meta.get("payeeMCC"), 10),
+            card_number=_str_or_none(cc_meta.get("cardNumber"), 20),
+            payment_type=_str_or_none(cc_meta.get("paymentType"), 20),
+            transaction_at=transaction_at,
+            bill_forecast_month=_year_month_or_none(cc_meta.get("billForecastDate")),
+            bill_post_date=_date_or_none(cc_meta.get("billPostDate")),
+            balance_after=_decimal_or_none(balance) if balance is not None else None,
+            payment_data=payment_data if isinstance(payment_data, dict) else None,
+        )
+
+    async def get_bill(self, credentials: dict, bill_external_id: str) -> Optional[BillData]:
+        """One bill by id — for bills referenced by transactions but missing
+        from the /bills listing (RFC toledo-features §4.3)."""
+        headers = await self._headers()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{PLUGGY_API_BASE}/bills/{bill_external_id}", headers=headers
+            )
+            resp.raise_for_status()
+            return _build_bill_data(resp.json())
+
+    async def get_item_status(self, credentials: dict) -> dict:
+        """Provider-side item snapshot stored on the connection (informational)."""
+        item_id = credentials.get("item_id") if credentials else None
+        if not item_id:
+            return {}
+        headers = await self._headers()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(f"{PLUGGY_API_BASE}/items/{item_id}", headers=headers)
+            resp.raise_for_status()
+            item = resp.json() or {}
+        return {
+            "status": _str_or_none(item.get("status"), 50),
+            "execution_status": _str_or_none(item.get("executionStatus"), 80),
+            "last_updated_at": _datetime_or_none(item.get("lastUpdatedAt")),
+            "consent_expires_at": _datetime_or_none(item.get("consentExpiresAt")),
+        }
 
     @staticmethod
     def _extract_after(next_value: Optional[str]) -> Optional[str]:

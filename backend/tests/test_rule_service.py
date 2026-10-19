@@ -516,7 +516,7 @@ async def test_set_description_validation_and_export_compatibility(
         ),
     )
     payload = await export_rules(session, test_workspace.id)
-    assert payload.version == 1
+    assert payload.version == 2  # Rules v2 export (RFC toledo-features §5.4); v1 still imports
     exported = next(item for item in payload.rules if item.name == rule.name)
     # The list can hold groups now, so narrow before reading a leaf's field.
     exported_condition = exported.conditions[0]
@@ -1119,11 +1119,14 @@ async def test_apply_single_rule_prefers_current_description_then_falls_back_to_
         transaction.original_description
         == "D01-123 AMZNPrime DE changing-token"
     )
-    assert transaction.category_id == test_categories[0].id
+    # Rules v2 (RFC toledo-features §5.3): a category a rule set is not the
+    # user's, so the higher-priority normalizer (10 < 20) now decides it.
+    assert transaction.category_id == test_categories[1].id
+    assert transaction.category_source == "rule"
     assert await apply_single_rule(
         session, test_workspace.id, normalizer
     ) == 0
-    assert transaction.category_id == test_categories[0].id
+    assert transaction.category_id == test_categories[1].id
 
 
 @pytest.mark.asyncio

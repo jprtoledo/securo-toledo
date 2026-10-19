@@ -21,6 +21,7 @@ from app.services.rule_service import create_rule
 
 async def _make_bill(session, test_workspace, test_user, account, **ov):
     data = RecurringTransactionCreate(
+        auto_generate=True,
         description=ov.pop("description", "Netflix Subscription"),
         amount=ov.pop("amount", Decimal("39.90")),
         currency=ov.pop("currency", "BRL"),

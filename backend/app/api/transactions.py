@@ -16,8 +16,9 @@ from app.core.workspace_context import (
     current_workspace,
     current_writable_workspace,
 )
-from app.schemas.transaction import BulkAddToGroupRequest, BulkCategorizeRequest, DescriptionSuggestion, BulkTagsRequest, CreateCounterpartRequest, InstallmentSeriesCreate, LinkTransferRequest, TransactionBulkDeleteRequest, TransactionCreate, TransactionRead, TransactionUpdate, TransferCreate, TransferRead
+from app.schemas.transaction import BulkAddToGroupRequest, BulkCategorizeRequest, DescriptionSuggestion, BulkTagsRequest, CreateCounterpartRequest, InstallmentSeriesCreate, LinkTransferRequest, SyncLockRequest, TransactionBulkDeleteRequest, TransactionCreate, TransactionRead, TransactionUpdate, TransferCreate, TransferRead
 from app.schemas.transaction_calendar import TransactionCalendarResponse
+from app.schemas.recurring_transaction import RecurringLinkRequest, RecurringReviewRequest
 from app.services import transaction_service
 from app.services.admin_service import get_credit_card_accounting_mode
 from app.services.transaction_calendar_service import get_transaction_calendar
@@ -129,6 +130,8 @@ async def list_transactions(
     exclude_transfers: bool = Query(False),
     user_pnl_only: bool = Query(False, description="Return only rows that count toward dashboard/user income/expense totals"),
     exclude_ignored: bool = Query(False, description="Drop rows the user marked ignored, or whose category is ignored"),
+    sync_state: Optional[str] = Query(None, pattern="^(removed|duplicate)$", description="Rows removed by the bank, or flagged as duplicates"),
+    statement_month: Optional[date] = Query(None, description="Card statement (due) month: rows whose effective date falls in it"),
     tags: Optional[List[str]] = Query(None),
     min_amount: Optional[float] = Query(None, ge=0, description="Filter to transactions with absolute amount >= this value (primary currency)."),
     max_amount: Optional[float] = Query(None, ge=0, description="Filter to transactions with absolute amount <= this value (primary currency)."),
@@ -147,6 +150,8 @@ async def list_transactions(
         txn_type=type, exclude_transfers=exclude_transfers,
         user_pnl_only=user_pnl_only,
         exclude_ignored=exclude_ignored,
+        sync_state=sync_state,
+        statement_month=statement_month,
         status=status,
         accounting_mode=accounting_mode,
         tags=tags,
@@ -212,6 +217,7 @@ async def export_transactions(
     type: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     exclude_ignored: bool = Query(False, description="Drop rows the user marked ignored, or whose category is ignored"),
+    sync_state: Optional[str] = Query(None, pattern="^(removed|duplicate)$"),
     tags: Optional[List[str]] = Query(None),
     transaction_ids: Optional[List[uuid.UUID]] = Query(None, description="If set, exports exactly these rows (scoped to the workspace); other filters are ignored."),
     ctx: WorkspaceContext = Depends(current_workspace),
@@ -236,6 +242,7 @@ async def export_transactions(
             search=q, uncategorized=uncategorized, txn_type=type, status=status, skip_pagination=True,
             accounting_mode=accounting_mode,
             exclude_ignored=exclude_ignored,
+            sync_state=sync_state,
             tags=tags,
         )
 
@@ -537,6 +544,194 @@ async def toggle_ignore_transaction(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
     primary_currency = ctx.user.primary_currency
     return _tag_fx_fallback(TransactionRead.model_validate(transaction, from_attributes=True), primary_currency)
+
+
+class InstallmentPlanLinkRequest(BaseModel):
+    # A plan id, "new" (a plan of its own) or null (undo: back to the heuristic).
+    plan_id: Optional[str] = None
+
+
+async def _plan_decision(session, ctx, transaction_id, decide):
+    from app.services import installment_plan_service
+    from app.services.recompute_service import recompute_account
+
+    transaction = await transaction_service.get_transaction(session, transaction_id, ctx.workspace.id)
+    if not transaction:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
+    try:
+        await decide(transaction)
+    except installment_plan_service.PlanDecisionError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    await recompute_account(session, transaction.account_id)
+    await session.commit()
+    transaction = await transaction_service.get_transaction(session, transaction_id, ctx.workspace.id)
+    return _tag_fx_fallback(TransactionRead.model_validate(transaction, from_attributes=True), ctx.user.primary_currency)
+
+
+@router.post("/{transaction_id}/installment-plan", response_model=TransactionRead)
+async def link_installment_plan(
+    transaction_id: uuid.UUID,
+    data: InstallmentPlanLinkRequest,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Link a parcel to a plan of the same card, split it into a plan of its
+    own ("new"), or undo the decision (null) — RFC toledo-features §7.3."""
+    from app.services import installment_plan_service
+
+    plan_id = data.plan_id
+    if plan_id not in (None, "new"):
+        try:
+            plan_id = str(uuid.UUID(plan_id))
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan id")
+    return await _plan_decision(
+        session, ctx, transaction_id,
+        lambda tx: installment_plan_service.link_parcel(session, tx, plan_id),
+    )
+
+
+@router.post("/{transaction_id}/installment-plan/confirm", response_model=TransactionRead)
+async def confirm_installment_plan(
+    transaction_id: uuid.UUID,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Accept a conflicting parcel in its plan (becomes a manual link)."""
+    from app.services import installment_plan_service
+
+    return await _plan_decision(
+        session, ctx, transaction_id,
+        lambda tx: installment_plan_service.confirm_parcel(session, tx),
+    )
+
+
+async def _recurring_decision(session, ctx, transaction_id, decide):
+    from app.services import recurrence_service
+    from app.services.recompute_service import recompute_account
+
+    transaction = await transaction_service.get_transaction(session, transaction_id, ctx.workspace.id)
+    if not transaction:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
+    try:
+        decide(transaction)
+    except (recurrence_service.RecurrenceDecisionError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    await recompute_account(session, transaction.account_id)
+    await session.commit()
+    transaction = await transaction_service.get_transaction(session, transaction_id, ctx.workspace.id)
+    return _tag_fx_fallback(TransactionRead.model_validate(transaction, from_attributes=True), ctx.user.primary_currency)
+
+
+@router.get("/{transaction_id}/recurring-draft", response_model=dict)
+async def get_recurring_draft(
+    transaction_id: uuid.UUID,
+    ctx: WorkspaceContext = Depends(current_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """"Make recurring": a recurrence prefilled from this transaction —
+    refused for parcels, bill payments and previous balances (AC-6.15)."""
+    from app.models.account import Account
+    from app.services import recurrence_service
+
+    transaction = await transaction_service.get_transaction(session, transaction_id, ctx.workspace.id)
+    if not transaction:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
+    account = await session.get(Account, transaction.account_id)
+    try:
+        return recurrence_service.draft_from_transaction(transaction, account)
+    except recurrence_service.RecurrenceDecisionError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{transaction_id}/recurring", response_model=TransactionRead)
+async def link_recurring(
+    transaction_id: uuid.UUID,
+    data: RecurringLinkRequest,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Link to a recurrence, mark "not a recurring charge" ("none"), or
+    undo the decisions (null) — RFC toledo-features §8.4."""
+    from app.services import recurrence_service
+
+    target = data.recurring_id
+    if target not in (None, "none"):
+        try:
+            rid = uuid.UUID(target)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid recurring id")
+        from app.services.recurring_transaction_service import get_recurring_transaction
+
+        if await get_recurring_transaction(session, rid, ctx.workspace.id) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recurring transaction not found")
+    return await _recurring_decision(
+        session, ctx, transaction_id, lambda tx: recurrence_service.link_manually(tx, target)
+    )
+
+
+@router.post("/{transaction_id}/recurring/review", response_model=TransactionRead)
+async def review_recurring(
+    transaction_id: uuid.UUID,
+    data: RecurringReviewRequest,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """accept: stays linked, out of the expected amount; reject: never
+    linked automatically to that recurrence again."""
+    from app.services import recurrence_service
+
+    return await _recurring_decision(
+        session, ctx, transaction_id, lambda tx: recurrence_service.review(tx, data.decision)
+    )
+
+
+@router.post("/{transaction_id}/recurring/confirm", response_model=TransactionRead)
+async def confirm_recurring(
+    transaction_id: uuid.UUID,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Confirm an "amount changed" conflict: the new amount becomes the
+    reference."""
+    from app.services import recurrence_service
+
+    return await _recurring_decision(
+        session, ctx, transaction_id, lambda tx: recurrence_service.confirm(tx)
+    )
+
+
+@router.post("/{transaction_id}/not-duplicate", response_model=TransactionRead)
+async def mark_not_duplicate(
+    transaction_id: uuid.UUID,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """The user says a flagged row is not a duplicate (AC-2.11)."""
+    transaction = await transaction_service.mark_not_duplicate(
+        session, transaction_id, ctx.workspace.id
+    )
+    if not transaction:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
+    transaction = await transaction_service.get_transaction(session, transaction.id, ctx.workspace.id)
+    return _tag_fx_fallback(TransactionRead.model_validate(transaction, from_attributes=True), ctx.user.primary_currency)
+
+
+@router.post("/{transaction_id}/sync-lock", response_model=TransactionRead)
+async def set_sync_lock(
+    transaction_id: uuid.UUID,
+    data: SyncLockRequest,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """"Don't update from the bank" (AC-2.3)."""
+    transaction = await transaction_service.set_sync_lock(
+        session, transaction_id, ctx.workspace.id, ctx.user_id, data.locked
+    )
+    if not transaction:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
+    transaction = await transaction_service.get_transaction(session, transaction.id, ctx.workspace.id)
+    return _tag_fx_fallback(TransactionRead.model_validate(transaction, from_attributes=True), ctx.user.primary_currency)
 
 
 @router.patch("/{transaction_id}/unlink-recurring", response_model=TransactionRead)

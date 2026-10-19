@@ -27,6 +27,8 @@ from app.models.payee import Payee, PayeeMapping
 from app.models.transaction import Transaction
 from app.models.user import User
 from app.providers import get_provider
+from app.providers.pluggy import PluggyAuthError
+from app.providers.pluggy_categories import PLUGGY_CATEGORY_MAP
 from app.providers.base import (
     AccountData,
     HoldingData,
@@ -37,6 +39,7 @@ from app.providers.base import (
 )
 from app.services import oauth_state
 from app.services import admin_service
+from app.services import pluggy_credential_service
 from app.services import reconciliation_service, recurring_match_service
 from app.services.text_similarity import token_overlap
 from app.services.account_service import (
@@ -48,9 +51,11 @@ from app.services.asset_group_service import (
     ensure_group_for_connection,
 )
 from app.services.credit_card_service import apply_effective_date
+from app.services.pluggy_sync.account import sync_pluggy_account
+from app.services.recompute_service import recompute_accounts
 from app.services.rule_engine import merge_notes
 from app.services.rule_service import apply_rules_to_transaction, preview_rules_for_transaction
-from app.services.transfer_detection_service import detect_transfer_pairs
+from app.services.transfer_detection_service import detect_transfer_pairs, pair_card_bill_payments
 from app.services.fx_rate_service import stamp_primary_amount
 from app.services.payee_service import get_or_create_payee
 from app.services.transaction_match_service import find_unique_transaction_match
@@ -211,30 +216,73 @@ async def _resolve_institution(
     cache[key] = inst
     return inst
 
-PLUGGY_CATEGORY_MAP = {
-    "Eating out": "Alimentação",
-    "Restaurants": "Alimentação",
-    "Food": "Alimentação",
-    "Groceries": "Mercado",
-    "Supermarkets": "Mercado",
-    "Pharmacy": "Saúde",
-    "Health": "Saúde",
-    "Taxi and ride-hailing": "Transporte",
-    "Transport": "Transporte",
-    "Gas": "Transporte",
-    "Travel": "Transporte",
-    "Housing": "Moradia",
-    "Rent": "Moradia",
-    "Utilities": "Moradia",
-    "Entertainment": "Lazer",
-    "Leisure": "Lazer",
-    "Education": "Educação",
-    "Subscriptions": "Assinaturas",
-    "Online services": "Assinaturas",
-    "Transfer": "Transferências",
-    "Transfers": "Transferências",
-    "Wire transfers": "Transferências",
-}
+
+
+async def _provider_for_connection(
+    session: AsyncSession, connection: BankConnection
+):
+    """The provider instance to use for an existing connection.
+
+    Pluggy connections authenticate with the Pluggy application they are
+    bound to (RFC Phase 1). An unbound connection with no single credential
+    to adopt still gets a provider: it fails on its first call with a clear
+    "not bound" error instead of here, so connection metadata stays usable.
+    Returns (provider, credential or None).
+    """
+    if connection.provider != "pluggy":
+        return get_provider(connection.provider), None
+    try:
+        credential = await pluggy_credential_service.credential_for_connection(
+            session, connection
+        )
+    except ProviderNotConfiguredError:
+        return get_provider(connection.provider), None
+    keys = pluggy_credential_service.decrypt_keys(credential)
+    return get_provider(connection.provider, credential=keys), credential
+
+
+_ACCOUNT_SNAPSHOT_FIELDS = (
+    "available_credit_limit",
+    "balance_close_date",
+    "balance_due_date",
+    "overdraft_limit",
+    "overdraft_used",
+    "card_holder_type",
+)
+
+
+def _apply_account_snapshot(account: Account, acc_data: AccountData) -> None:
+    """Provider snapshot columns (RFC toledo-features §4.3). Like the other
+    provider metadata, a value the provider stops sending is kept."""
+    for name in _ACCOUNT_SNAPSHOT_FIELDS:
+        value = getattr(acc_data, name, None)
+        if value is not None and getattr(account, name) != value:
+            setattr(account, name, value)
+
+
+async def _store_provider_item_status(
+    provider, connection: BankConnection, credentials: dict
+) -> None:
+    """Pluggy item status on the connection — informational, best effort."""
+    getter = getattr(provider, "get_item_status", None)
+    if getter is None:
+        return
+    try:
+        item = await getter(credentials)
+    except Exception:  # noqa: BLE001 — never fails a sync
+        logger.info("Could not read provider item status for %s", connection.id, exc_info=True)
+        return
+    if not isinstance(item, dict) or not item:
+        return
+    for column, key in (
+        ("provider_status", "status"),
+        ("provider_execution_status", "execution_status"),
+        ("provider_last_updated_at", "last_updated_at"),
+        ("consent_expires_at", "consent_expires_at"),
+    ):
+        value = item.get(key)
+        if getattr(connection, column) != value:
+            setattr(connection, column, value)
 
 
 def _sync_assets_enabled(settings: Optional[dict]) -> bool:
@@ -251,6 +299,7 @@ async def _sync_holdings(
     user_id: uuid.UUID,
     connection: BankConnection,
     credentials: dict,
+    provider=None,
 ) -> None:
     """Fetch investment holdings from the provider and upsert them as Assets.
 
@@ -272,7 +321,8 @@ async def _sync_holdings(
     # Storage errors below are intentionally not caught — they indicate
     # a schema/invariant bug we want to surface, not a hiccup to swallow.
     try:
-        provider = get_provider(connection.provider)
+        if provider is None:
+            provider = get_provider(connection.provider)
         holdings = await provider.get_holdings(credentials)
     except Exception:  # noqa: BLE001
         logger.exception(
@@ -852,7 +902,9 @@ async def _find_installment_category(
     session: AsyncSession,
     account_id: uuid.UUID,
     txn_data,
-) -> Optional[uuid.UUID]:
+    *,
+    with_source: bool = False,
+):
     """Reuse the latest user-selected category from an earlier installment.
 
     Pluggy gives every parcel the original purchase date, installment count,
@@ -873,7 +925,7 @@ async def _find_installment_category(
         return None
 
     result = await session.execute(
-        select(Transaction.category_id)
+        select(Transaction.category_id, Transaction.category_source)
         .where(
             Transaction.account_id == account_id,
             Transaction.source == "sync",
@@ -887,7 +939,12 @@ async def _find_installment_category(
         .order_by(Transaction.installment_number.desc(), Transaction.date.desc())
         .limit(1)
     )
-    return result.scalars().first()
+    row = result.first()
+    if with_source:
+        # The parcel inherits the earlier parcel's provenance, so a manual
+        # choice stays manual and a rule's stays the rule's (RFC §5.3).
+        return (row[0], row[1] or "manual") if row else (None, None)
+    return row[0] if row else None
 
 
 async def get_connections(session: AsyncSession, workspace_id: uuid.UUID) -> list[BankConnection]:
@@ -991,8 +1048,39 @@ async def list_provider_institutions(
 
 
 async def create_connect_token(
-    provider_name: str, user_id: uuid.UUID, item_id: str | None = None
+    provider_name: str,
+    user_id: uuid.UUID,
+    item_id: str | None = None,
+    *,
+    session: Optional[AsyncSession] = None,
+    pluggy_credential_id: Optional[uuid.UUID] = None,
+    connection: Optional[BankConnection] = None,
 ) -> dict:
+    """Connect token for a widget flow.
+
+    Pluggy: a reconnect (``connection`` given) uses the connection's own
+    credential (AC-1.6); a new Item uses ``pluggy_credential_id``, or the
+    only credential when there is one (AC-1.5).
+    """
+    if provider_name == "pluggy" and session is not None:
+        if connection is not None:
+            provider, credential = await _provider_for_connection(session, connection)
+        else:
+            credential = await pluggy_credential_service.credential_for_new_item(
+                session, pluggy_credential_id
+            )
+            provider = get_provider(
+                provider_name,
+                credential=pluggy_credential_service.decrypt_keys(credential),
+            )
+        try:
+            token_data = await provider.create_connect_token(str(user_id), item_id=item_id)
+        except PluggyAuthError as exc:
+            if credential is not None:
+                await pluggy_credential_service.record_auth_error(session, credential.id, str(exc))
+                await session.commit()
+            raise
+        return {"access_token": token_data.access_token}
     provider = get_provider(provider_name)
     token_data = await provider.create_connect_token(str(user_id), item_id=item_id)
     return {"access_token": token_data.access_token}
@@ -1033,6 +1121,7 @@ async def handle_oauth_callback(
     state: Optional[str] = None,
     sync_assets: Optional[bool] = None,
     reconnect_connection_id: Optional[uuid.UUID] = None,
+    pluggy_credential_id: Optional[uuid.UUID] = None,
 ) -> BankConnection:
     state_payload: dict = {}
     if state:
@@ -1062,7 +1151,21 @@ async def handle_oauth_callback(
     if not provider_name:
         raise ValueError("OAuth callback missing provider")
 
-    provider = get_provider(provider_name)
+    pluggy_credential = None
+    if existing_reconnect is not None and provider_name == "pluggy":
+        provider, pluggy_credential = await _provider_for_connection(
+            session, existing_reconnect
+        )
+    elif provider_name == "pluggy":
+        pluggy_credential = await pluggy_credential_service.credential_for_new_item(
+            session, pluggy_credential_id
+        )
+        provider = get_provider(
+            provider_name,
+            credential=pluggy_credential_service.decrypt_keys(pluggy_credential),
+        )
+    else:
+        provider = get_provider(provider_name)
     connection_data = await provider.handle_oauth_callback(code)
 
     if existing_reconnect:
@@ -1097,6 +1200,7 @@ async def handle_oauth_callback(
         credentials=connection_data.credentials,
         settings=initial_settings,
         status="active",
+        pluggy_credential_id=pluggy_credential.id if pluggy_credential else None,
     )
     session.add(connection)
     await session.flush()
@@ -1136,12 +1240,34 @@ async def handle_oauth_callback(
             ),
             institution_id=institution.id if institution else None,
         )
+        _apply_account_snapshot(account, acc_data)
         session.add(account)
         await session.flush()
 
         bills_by_external_id = await _sync_credit_card_bills(
             session, user_id, account, provider, connection_data.credentials
         )
+
+        if provider_name == "pluggy":
+            # New account, no watermark: the whole history (RFC §4.4).
+            await sync_pluggy_account(
+                session,
+                provider=provider,
+                credentials=connection_data.credentials,
+                account=account,
+                acc_data=acc_data,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                user_currency=user_currency,
+                payee_source="auto",
+                import_pending=True,
+                use_provider_cats=use_provider_cats,
+                bills_by_external_id=bills_by_external_id,
+                new_tx_ids=new_tx_ids,
+            )
+            await recompute_accounts(session, [account.id])
+            await sync_opening_balance_for_connected_account(session, account)
+            continue
 
         # Fetch initial transactions (since=None fetches all available history)
         transactions_data = await provider.get_transactions(
@@ -1270,6 +1396,8 @@ async def handle_oauth_callback(
 
     # Detect transfer pairs among newly synced transactions
     await detect_transfer_pairs(session, workspace_id, candidate_ids=new_tx_ids)
+    # Card bill payments, once recompute has classified the card lines.
+    await pair_card_bill_payments(session, workspace_id, candidate_ids=new_tx_ids)
 
     # And settle what this money was promised against, once the rows exist.
     if new_tx_ids:
@@ -1288,7 +1416,9 @@ async def handle_oauth_callback(
     # /accounts. Pulled after account setup when enabled so holdings are
     # available on the Assets page immediately after the widget closes.
     if _sync_assets_enabled(connection.settings):
-        await _sync_holdings(session, user_id, connection, connection_data.credentials)
+        await _sync_holdings(
+            session, user_id, connection, connection_data.credentials, provider
+        )
 
     connection.last_sync_at = datetime.now(timezone.utc)
     await session.commit()
@@ -1846,6 +1976,17 @@ async def _sync_credit_card_bills(
     if not bills_data:
         return {}
 
+    return await _upsert_credit_card_bills(session, user_id, account, bills_data)
+
+
+async def _upsert_credit_card_bills(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    account: Account,
+    bills_data: list,
+) -> dict[str, CreditCardBill]:
+    """Upsert provider bills for an account and materialize their finance
+    charges. Returns every stored bill of the account by external id."""
     existing = (
         await session.execute(
             select(CreditCardBill).where(CreditCardBill.account_id == account.id)
@@ -1865,15 +2006,29 @@ async def _sync_credit_card_bills(
                 currency=bd.currency,
                 minimum_payment=bd.minimum_payment,
                 raw_data=bd.raw_data,
+                closing_date=bd.closing_date,
+                allows_installments=bd.allows_installments,
+                payments=bd.payments,
+                finance_charges_total=bd.finance_charges_total,
             )
             session.add(bill)
             by_external_id[bd.external_id] = bill
         else:
-            bill.due_date = bd.due_date
-            bill.total_amount = bd.total_amount
-            bill.currency = bd.currency
-            bill.minimum_payment = bd.minimum_payment
-            bill.raw_data = bd.raw_data
+            for column, value in (
+                ("due_date", bd.due_date),
+                ("total_amount", bd.total_amount),
+                ("currency", bd.currency),
+                ("minimum_payment", bd.minimum_payment),
+                ("raw_data", bd.raw_data),
+                ("closing_date", bd.closing_date),
+                ("allows_installments", bd.allows_installments),
+                ("payments", bd.payments),
+                ("finance_charges_total", bd.finance_charges_total),
+            ):
+                # Unchanged values are left alone so a repeat sync issues no
+                # UPDATE (RFC toledo-features INV-3).
+                if getattr(bill, column) != value:
+                    setattr(bill, column, value)
 
     await session.flush()
 
@@ -1890,6 +2045,175 @@ async def _sync_credit_card_bills(
             )
 
     return by_external_id
+
+
+async def _insert_synced_transaction(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    account: Account,
+    acc_data: AccountData,
+    txn_data,
+    bills_by_external_id: dict[str, CreditCardBill],
+    user_currency: str,
+    use_provider_cats: bool,
+    new_tx_ids: list[uuid.UUID],
+) -> tuple[str, Optional[Transaction]]:
+    """Land one incoming provider transaction that matched no stored row.
+
+    Either upgrades a generated recurring placeholder in place ("merged"),
+    leaves an ignored placeholder alone ("skipped"), or inserts a new row
+    with rules, category, recurring link and FX applied ("inserted").
+    Returns the outcome and the row it landed on.
+    """
+    incoming_currency = (
+        txn_data.currency or acc_data.currency or user_currency
+    )
+    inherited = await _find_installment_category(
+        session, account.id, txn_data, with_source=True
+    )
+    category_id, fallback_source = (
+        inherited if isinstance(inherited, tuple) else (inherited, "manual" if inherited else None)
+    )
+    if category_id is None:
+        category_id = await _match_pluggy_category(
+            session,
+            workspace_id,
+            txn_data.pluggy_category,
+            enabled=use_provider_cats,
+        )
+        fallback_source = "provider" if category_id is not None else None
+
+    sync_payee_id = None
+    if txn_data.payee:
+        sync_payee_entity = await get_or_create_payee(
+            session,
+            user_id,
+            txn_data.payee,
+            workspace_id=workspace_id,
+        )
+        sync_payee_id = sync_payee_entity.id
+
+    bill = (
+        bills_by_external_id.get(txn_data.bill_external_id)
+        if txn_data.bill_external_id
+        else None
+    )
+    transaction = Transaction(
+        user_id=user_id,
+        workspace_id=workspace_id,
+        account_id=account.id,
+        external_id=txn_data.external_id,
+        description=txn_data.description,
+        original_description=txn_data.description,
+        amount=txn_data.amount,
+        currency=incoming_currency,
+        date=txn_data.date,
+        type=txn_data.type,
+        source="sync",
+        status=txn_data.status,
+        payee=txn_data.payee,
+        payee_id=sync_payee_id,
+        raw_data=txn_data.raw_data,
+        category_id=None,
+        installment_number=txn_data.installment_number,
+        total_installments=txn_data.total_installments,
+        installment_total_amount=txn_data.installment_total_amount,
+        installment_purchase_date=txn_data.installment_purchase_date,
+        bill_id=bill.id if bill else None,
+    )
+    apply_effective_date(
+        transaction,
+        account,
+        bill_due_date=bill.due_date if bill else None,
+    )
+    preview = await preview_rules_for_transaction(
+        session, user_id, transaction
+    )
+
+    # Normalize before recurring reconciliation. A generated
+    # placeholder is upgraded in place; otherwise the normalized
+    # candidate may fulfill an active definition, which advances so
+    # later generation cannot duplicate the occurrence.
+    placeholder = (
+        await recurring_match_service.find_placeholder_for_incoming(
+            session,
+            account.id,
+            txn_data.amount,
+            incoming_currency,
+            txn_data.type,
+            txn_data.date,
+            preview.description,
+        )
+    )
+    if placeholder:
+        if placeholder.is_ignored:
+            return "skipped", placeholder
+        placeholder.external_id = txn_data.external_id
+        placeholder.source = "sync"
+        placeholder.status = txn_data.status
+        placeholder.raw_data = txn_data.raw_data
+        # Same shape as the import path: fold in the `preview` the
+        # rules already produced from the incoming charge instead of
+        # re-running them against the placeholder, whose description
+        # is the recurring definition's own wording. Existing values
+        # win, the charge fills the empty ones, and only its
+        # provenance is recorded outright.
+        placeholder.original_description = txn_data.description
+        if placeholder.category_id is None:
+            placeholder.category_id = preview.category_id or category_id
+        if txn_data.payee and not placeholder.payee:
+            placeholder.payee = txn_data.payee
+        if placeholder.payee_id is None:
+            placeholder.payee_id = preview.payee_id
+        placeholder.notes = merge_notes(
+            placeholder.notes, preview.notes
+        )
+        if preview.is_ignored:
+            placeholder.is_ignored = True
+        return "merged", placeholder
+
+    recurring_link = (
+        await recurring_match_service.find_bill_for_incoming(
+            session,
+            user_id,
+            account.id,
+            txn_data.amount,
+            incoming_currency,
+            txn_data.type,
+            txn_data.date,
+            preview.description,
+        )
+    )
+    transaction.recurring_transaction_id = (
+        recurring_link.id if recurring_link else None
+    )
+    session.add(transaction)
+    await session.flush()
+    if recurring_link is not None:
+        recurring_match_service.advance_past(
+            recurring_link, txn_data.date
+        )
+    new_tx_ids.append(transaction.id)
+    await apply_rules_to_transaction(session, user_id, transaction)
+    if transaction.category_id is None and transaction.category_source is None:
+        transaction.category_id = category_id
+        transaction.category_source = fallback_source
+
+    # Prefer bank-provided conversion for international transactions
+    acct_currency = acc_data.currency or user_currency
+    if (
+        txn_data.amount_in_account_currency is not None
+        and txn_data.amount
+        and acct_currency == user_currency
+        and txn_data.currency != acct_currency
+    ):
+        transaction.amount_primary = txn_data.amount_in_account_currency
+        transaction.fx_rate_used = txn_data.amount_in_account_currency / txn_data.amount
+    else:
+        await stamp_primary_amount(session, user_id, transaction)
+    return "inserted", transaction
 
 
 async def sync_connection(
@@ -1930,7 +2254,7 @@ async def sync_connection(
     # provider is a server misconfiguration, and the catch-all below would
     # wrongly stamp the (healthy) connection with status="error".
     try:
-        provider = get_provider(connection.provider)
+        provider, pluggy_credential = await _provider_for_connection(session, connection)
     except ValueError as exc:
         raise ProviderNotConfiguredError(
             f"Provider '{connection.provider}' is not configured in this process. "
@@ -1986,6 +2310,11 @@ async def sync_connection(
         new_tx_ids: list[uuid.UUID] = []
         merged_count = 0
         live_txn_external_ids: dict[uuid.UUID, set[str]] = {}
+        # Accounts whose derived columns are recomputed after the sync
+        # (Pluggy; RFC toledo-features §5.1).
+        recompute_account_ids: list[uuid.UUID] = []
+        if connection.provider == "pluggy":
+            await _store_provider_item_status(provider, connection, credentials)
         accounts_data = await provider.get_accounts(credentials)
         incoming_external_ids = {acc.external_id for acc in accounts_data}
         institution_cache: dict[str, Institution] = {}
@@ -2004,17 +2333,29 @@ async def sync_connection(
             if account is not None:
                 account.user_id = user_id
                 account.workspace_id = connection.workspace_id
+                # Only rows that actually differ: a repeat sync rewrites
+                # nothing (RFC toledo-features INV-3).
                 await session.execute(
                     update(Transaction)
                     .where(
                         Transaction.account_id == account.id,
                         Transaction.source == "sync",
+                        or_(
+                            Transaction.user_id != user_id,
+                            Transaction.workspace_id != connection.workspace_id,
+                        ),
                     )
                     .values(user_id=user_id, workspace_id=connection.workspace_id)
                 )
                 await session.execute(
                     update(CreditCardBill)
-                    .where(CreditCardBill.account_id == account.id)
+                    .where(
+                        CreditCardBill.account_id == account.id,
+                        or_(
+                            CreditCardBill.user_id != user_id,
+                            CreditCardBill.workspace_id != connection.workspace_id,
+                        ),
+                    )
                     .values(user_id=user_id, workspace_id=connection.workspace_id)
                 )
 
@@ -2064,10 +2405,14 @@ async def sync_connection(
                     # the higher source of truth than a fresh None.
                     if acc_data.credit_limit is not None:
                         account.credit_limit = acc_data.credit_limit
-                    if acc_data.statement_close_day is not None:
-                        account.statement_close_day = acc_data.statement_close_day
-                    if acc_data.payment_due_day is not None:
-                        account.payment_due_day = acc_data.payment_due_day
+                    # Pluggy cards derive their cycle days from the bills
+                    # in recompute (RFC toledo-features §6.3); the provider's
+                    # balance dates are one input, kept on the account.
+                    if connection.provider != "pluggy":
+                        if acc_data.statement_close_day is not None:
+                            account.statement_close_day = acc_data.statement_close_day
+                        if acc_data.payment_due_day is not None:
+                            account.payment_due_day = acc_data.payment_due_day
                     if acc_data.minimum_payment is not None:
                         account.minimum_payment = acc_data.minimum_payment
                     if acc_data.card_brand is not None:
@@ -2078,6 +2423,7 @@ async def sync_connection(
                         f"{connection.id}:{acc_data.shared_balance_group}"
                         if acc_data.shared_balance_group else None
                     )
+                _apply_account_snapshot(account, acc_data)
             else:
                 is_cc = acc_data.type == "credit_card"
                 account = Account(
@@ -2103,6 +2449,7 @@ async def sync_connection(
                     ),
                     institution_id=institution.id if institution else None,
                 )
+                _apply_account_snapshot(account, acc_data)
                 session.add(account)
                 await session.flush()
 
@@ -2112,6 +2459,28 @@ async def sync_connection(
             bills_by_external_id = await _sync_credit_card_bills(
                 session, user_id, account, provider, credentials
             )
+
+            if connection.provider == "pluggy":
+                # RFC toledo-features Phase 2: sweeps, provider updates,
+                # re-key by providerId, soft removal, missing bills.
+                pluggy_result = await sync_pluggy_account(
+                    session,
+                    provider=provider,
+                    credentials=credentials,
+                    account=account,
+                    acc_data=acc_data,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    user_currency=user_currency,
+                    payee_source=payee_source,
+                    import_pending=import_pending,
+                    use_provider_cats=use_provider_cats,
+                    bills_by_external_id=bills_by_external_id,
+                    new_tx_ids=new_tx_ids,
+                )
+                merged_count += pluggy_result.merged
+                recompute_account_ids.append(account.id)
+                continue
 
             # Fetch and sync transactions. The 14-day rewind is on Pluggy's
             # `createdAt` (when their row was inserted), so it covers two
@@ -2234,148 +2603,20 @@ async def sync_connection(
                         )
                     continue
 
-                incoming_currency = (
-                    txn_data.currency or acc_data.currency or user_currency
-                )
-                category_id = await _find_installment_category(
-                    session, account.id, txn_data
-                )
-                if category_id is None:
-                    category_id = await _match_pluggy_category(
-                        session,
-                        workspace_id,
-                        txn_data.pluggy_category,
-                        enabled=use_provider_cats,
-                    )
-
-                sync_payee_id = None
-                if txn_data.payee:
-                    sync_payee_entity = await get_or_create_payee(
-                        session,
-                        user_id,
-                        txn_data.payee,
-                        workspace_id=workspace_id,
-                    )
-                    sync_payee_id = sync_payee_entity.id
-
-                bill = (
-                    bills_by_external_id.get(txn_data.bill_external_id)
-                    if txn_data.bill_external_id
-                    else None
-                )
-                transaction = Transaction(
+                outcome, _row = await _insert_synced_transaction(
+                    session,
                     user_id=user_id,
                     workspace_id=workspace_id,
-                    account_id=account.id,
-                    external_id=txn_data.external_id,
-                    description=txn_data.description,
-                    original_description=txn_data.description,
-                    amount=txn_data.amount,
-                    currency=incoming_currency,
-                    date=txn_data.date,
-                    type=txn_data.type,
-                    source="sync",
-                    status=txn_data.status,
-                    payee=txn_data.payee,
-                    payee_id=sync_payee_id,
-                    raw_data=txn_data.raw_data,
-                    category_id=None,
-                    installment_number=txn_data.installment_number,
-                    total_installments=txn_data.total_installments,
-                    installment_total_amount=txn_data.installment_total_amount,
-                    installment_purchase_date=txn_data.installment_purchase_date,
-                    bill_id=bill.id if bill else None,
+                    account=account,
+                    acc_data=acc_data,
+                    txn_data=txn_data,
+                    bills_by_external_id=bills_by_external_id,
+                    user_currency=user_currency,
+                    use_provider_cats=use_provider_cats,
+                    new_tx_ids=new_tx_ids,
                 )
-                apply_effective_date(
-                    transaction,
-                    account,
-                    bill_due_date=bill.due_date if bill else None,
-                )
-                preview = await preview_rules_for_transaction(
-                    session, user_id, transaction
-                )
-
-                # Normalize before recurring reconciliation. A generated
-                # placeholder is upgraded in place; otherwise the normalized
-                # candidate may fulfill an active definition, which advances so
-                # later generation cannot duplicate the occurrence.
-                placeholder = (
-                    await recurring_match_service.find_placeholder_for_incoming(
-                        session,
-                        account.id,
-                        txn_data.amount,
-                        incoming_currency,
-                        txn_data.type,
-                        txn_data.date,
-                        preview.description,
-                    )
-                )
-                if placeholder:
-                    if placeholder.is_ignored:
-                        continue
-                    placeholder.external_id = txn_data.external_id
-                    placeholder.source = "sync"
-                    placeholder.status = txn_data.status
-                    placeholder.raw_data = txn_data.raw_data
-                    # Same shape as the import path: fold in the `preview` the
-                    # rules already produced from the incoming charge instead of
-                    # re-running them against the placeholder, whose description
-                    # is the recurring definition's own wording. Existing values
-                    # win, the charge fills the empty ones, and only its
-                    # provenance is recorded outright.
-                    placeholder.original_description = txn_data.description
-                    if placeholder.category_id is None:
-                        placeholder.category_id = preview.category_id or category_id
-                    if txn_data.payee and not placeholder.payee:
-                        placeholder.payee = txn_data.payee
-                    if placeholder.payee_id is None:
-                        placeholder.payee_id = preview.payee_id
-                    placeholder.notes = merge_notes(
-                        placeholder.notes, preview.notes
-                    )
-                    if preview.is_ignored:
-                        placeholder.is_ignored = True
+                if outcome == "merged":
                     merged_count += 1
-                    continue
-
-                recurring_link = (
-                    await recurring_match_service.find_bill_for_incoming(
-                        session,
-                        user_id,
-                        account.id,
-                        txn_data.amount,
-                        incoming_currency,
-                        txn_data.type,
-                        txn_data.date,
-                        preview.description,
-                    )
-                )
-                transaction.recurring_transaction_id = (
-                    recurring_link.id if recurring_link else None
-                )
-                session.add(transaction)
-                await session.flush()
-                if recurring_link is not None:
-                    recurring_match_service.advance_past(
-                        recurring_link, txn_data.date
-                    )
-                new_tx_ids.append(transaction.id)
-                await apply_rules_to_transaction(session, user_id, transaction)
-                if transaction.category_id is None:
-                    transaction.category_id = category_id
-
-                # Prefer bank-provided conversion for international transactions
-                acct_currency = acc_data.currency or user_currency
-                if (
-                    txn_data.amount_in_account_currency is not None
-                    and txn_data.amount
-                    and acct_currency == user_currency
-                    and txn_data.currency != acct_currency
-                ):
-                    transaction.amount_primary = txn_data.amount_in_account_currency
-                    transaction.fx_rate_used = txn_data.amount_in_account_currency / txn_data.amount
-                else:
-                    await stamp_primary_amount(session, user_id, transaction)
 
             # Reconcile the opening balance after any new transactions land so
             # SUM(all txs) keeps matching account.balance from the provider.
@@ -2406,10 +2647,22 @@ async def sync_connection(
 
         # Clean up phantom duplicates: providers occasionally double-report the
         # same payment with different ids. Once transfer detection has paired
-        # the real one, the orphan twin gets removed here.
-        touched_account_ids = await _cleanup_phantom_duplicates(
-            session, connection.id, live_txn_external_ids
-        )
+        # the real one, the orphan twin gets removed here. Pluggy never
+        # hard-deletes: its duplicates are flagged by recompute instead.
+        touched_account_ids: set[uuid.UUID] = set()
+        if connection.provider != "pluggy":
+            touched_account_ids = await _cleanup_phantom_duplicates(
+                session, connection.id, live_txn_external_ids
+            )
+
+        # Derived columns (duplicates, ...) of every synced Pluggy account,
+        # then their opening balances: a newly flagged duplicate or removed
+        # row no longer counts.
+        if recompute_account_ids:
+            await recompute_accounts(session, recompute_account_ids)
+            touched_account_ids |= set(recompute_account_ids)
+            # Card bill payments, now that the card lines are classified.
+            await pair_card_bill_payments(session, workspace_id, candidate_ids=new_tx_ids)
 
         # The opening balances above were reconciled with the phantoms still
         # counted. Reconcile the open accounts that lost one again, so the
@@ -2431,7 +2684,7 @@ async def sync_connection(
         # don't fail the sync; a bank connector that doesn't expose
         # /investments shouldn't block the transaction sync that just succeeded.
         if _sync_assets_enabled(conn_settings):
-            await _sync_holdings(session, user_id, connection, credentials)
+            await _sync_holdings(session, user_id, connection, credentials, provider)
 
         # Reap institution rows referenced by nothing. Id-carrying servers
         # never orphan a row (renames update in place), but a name-only
@@ -2451,6 +2704,9 @@ async def sync_connection(
         for orphan in orphaned_institutions.scalars().all():
             await session.delete(orphan)
 
+        if pluggy_credential is not None:
+            await pluggy_credential_service.clear_auth_error(session, pluggy_credential)
+
         connection.last_sync_at = datetime.now(timezone.utc)
         action_required_warnings = getattr(provider, "action_required_warnings", None)
         if isinstance(action_required_warnings, list) and action_required_warnings:
@@ -2467,6 +2723,25 @@ async def sync_connection(
         await session.refresh(connection)
         return connection, merged_count
 
+    except ProviderNotConfiguredError:
+        # Server-side configuration (no Pluggy application bound): the bank
+        # credentials are fine, so the connection is not flagged.
+        await session.rollback()
+        raise
+    except PluggyAuthError as exc:
+        # The Pluggy application's keys were refused (AC-1.3): remember the
+        # message on the credential so the admin page shows it. Every
+        # connection of that application fails the same way; flag this one.
+        await session.rollback()
+        async with session.begin():
+            if exc.credential_id:
+                await pluggy_credential_service.record_auth_error(
+                    session, exc.credential_id, str(exc)
+                )
+            conn = await session.get(BankConnection, connection_id)
+            if conn:
+                conn.status = "error"
+        raise
     except SessionExpiredError:
         # Provider consent expired — distinct from a generic error so the UI
         # can show a clearer "reauthorize" prompt.

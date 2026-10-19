@@ -1018,6 +1018,7 @@ class TestRecurringTransactionStamping:
         from app.services.recurring_transaction_service import create_recurring_transaction
 
         data = RecurringTransactionCreate(
+            auto_generate=True,
             description="Monthly subscription",
             amount=Decimal("10.00"),
             type="debit",
@@ -1046,6 +1047,7 @@ class TestRecurringTransactionStamping:
         from app.services.recurring_transaction_service import create_recurring_transaction
 
         data = RecurringTransactionCreate(
+            auto_generate=True,
             description="Rent",
             amount=Decimal("2000.00"),
             type="debit",
@@ -1078,6 +1080,7 @@ class TestRecurringTransactionStamping:
 
         start = date.today() - timedelta(days=35)
         data = RecurringTransactionCreate(
+            auto_generate=True,
             description="Weekly sub",
             amount=Decimal("15.00"),
             type="debit",
@@ -1302,6 +1305,7 @@ class TestRecurringFxRestamp:
         from app.services.fx_rate_service import stamp_primary_amount
 
         data = RecurringTransactionCreate(
+            auto_generate=True,
             description="USD subscription",
             amount=Decimal("10.00"),
             type="debit",
@@ -1343,6 +1347,7 @@ class TestRecurringFxRestamp:
         from app.services.recurring_transaction_service import create_recurring_transaction
 
         data = RecurringTransactionCreate(
+            auto_generate=True,
             description="BRL rent",
             amount=Decimal("2000.00"),
             type="debit",

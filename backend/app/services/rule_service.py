@@ -6,6 +6,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
+from app.models.account import Account
 from app.models.rule import Rule
 from app.models.category import Category
 from app.models.payee import Payee
@@ -23,12 +24,17 @@ from app.schemas.rule import (
 from app.services.category_service import get_assignable_category_ids
 
 from app.services.rule_engine import (
+    ACCOUNT_KINDS,
+    account_kind_of,
     apply_rule_actions,
-    compile_rule_regex,
     evaluate_conditions,
+    rule_definition_errors,
+    rule_in_scope,
 )
+from app.schemas.rule import dump_conditions
 
 from app.services.category_service import DEFAULT_CATEGORIES_I18N
+from app.services.builtin_rules import BR_CARDS, BUILTIN_PACKS, localized
 
 
 class DuplicateRuleError(Exception):
@@ -36,42 +42,31 @@ class DuplicateRuleError(Exception):
     pass
 
 
-_ALLOWED_CONDITION_FIELDS = {
-    "description", "payee", "notes", "amount", "type", "account_id", "payee_id", "date",
-    "status",
-}
-# Status is a closed set, so only equality makes sense and the value must be one
-# of the statuses a transaction can carry.
-_STATUS_CONDITION_OPS = {"equals", "not_equals"}
-_STATUS_CONDITION_VALUES = {"pending", "posted"}
-_ALLOWED_CONDITION_OPS = {
-    "contains", "not_contains", "equals", "not_equals", "starts_with",
-    "ends_with", "regex", "gt", "gte", "lt", "lte",
-}
-_ALLOWED_ACTION_OPS = {
-    "set_category", "set_payee", "set_description", "append_notes", "ignore",
-}
-
-
 def _rule_item_value(item, key: str):
     return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
 
 
-def _flatten_conditions(conditions: list) -> list:
-    """Return every leaf condition, unwrapping one level of AND/OR groups.
-
-    A rule's condition list mixes leaves with groups that hold their own leaves
-    (see `rule_engine.evaluate_conditions`). Field/operator checks apply to the
-    leaves either way, and the schema caps nesting at one level.
-    """
-    leaves = []
-    for node in conditions or []:
-        nested = _rule_item_value(node, "conditions")
-        if isinstance(nested, list):
-            leaves.extend(nested)
-        else:
-            leaves.append(node)
-    return leaves
+async def resolve_scope(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    scope_kind: Optional[str],
+    scope_account_id: Optional[uuid.UUID],
+) -> Optional[str]:
+    """The effective scope kind. Scoping to one account forces the kind to
+    that account's (RFC toledo-features §5.3)."""
+    if scope_account_id is None:
+        return scope_kind
+    account = (
+        await session.execute(
+            select(Account).where(Account.id == scope_account_id, Account.workspace_id == workspace_id)
+        )
+    ).scalar_one_or_none()
+    if account is None:
+        raise ValueError("Account not found")
+    kind = account_kind_of(account.type)
+    if kind not in ACCOUNT_KINDS:
+        raise ValueError("Rules can only be scoped to bank accounts or credit cards")
+    return kind
 
 
 async def _validate_rule_definition(
@@ -79,26 +74,18 @@ async def _validate_rule_definition(
     workspace_id: uuid.UUID,
     conditions: list,
     actions: list,
+    *,
+    conditions_op: str = "and",
+    scope_kind: Optional[str] = None,
 ) -> None:
-    for condition in _flatten_conditions(conditions):
-        field = _rule_item_value(condition, "field")
-        op = _rule_item_value(condition, "op")
-        if field not in _ALLOWED_CONDITION_FIELDS or op not in _ALLOWED_CONDITION_OPS:
-            raise ValueError("Invalid rule condition")
-        if field == "status" and (
-            op not in _STATUS_CONDITION_OPS
-            or str(_rule_item_value(condition, "value") or "").strip().lower()
-            not in _STATUS_CONDITION_VALUES
-        ):
-            raise ValueError("Invalid rule condition")
-        if op == "regex":
-            compile_rule_regex(str(_rule_item_value(condition, "value") or ""))
+    """Raise ValueError with the first problem of a rule definition."""
+    errors = rule_definition_errors(scope_kind, conditions_op, conditions, actions)
+    if errors:
+        raise ValueError(errors[0]["message"])
 
     for action in actions or []:
         op = _rule_item_value(action, "op")
         value = _rule_item_value(action, "value")
-        if op not in _ALLOWED_ACTION_OPS:
-            raise ValueError("Invalid rule action")
         if op == "set_category":
             try:
                 category_id = uuid.UUID(str(value))
@@ -125,11 +112,39 @@ async def _validate_rule_definition(
             )
             if exists_result.scalar_one_or_none() is None:
                 raise ValueError("Payee not found")
-        elif op == "set_description":
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError("Description cannot be blank")
-            if len(value.strip()) > 500:
-                raise ValueError("Description cannot exceed 500 characters")
+
+
+async def rule_errors(
+    session: AsyncSession, workspace_id: uuid.UUID, rules: list[Rule]
+) -> dict[uuid.UUID, list[dict]]:
+    """Problems that make the engine skip each rule (AC-3.13): shown in the
+    UI instead of silently ignored."""
+    category_ids = {
+        row[0]
+        for row in (
+            await session.execute(select(Category.id).where(Category.workspace_id == workspace_id))
+        ).all()
+    }
+    out: dict[uuid.UUID, list[dict]] = {}
+    for rule in rules:
+        errors = rule_definition_errors(
+            rule.scope_account_kind, rule.conditions_op, rule.conditions or [], rule.actions or []
+        )
+        for action in rule.actions or []:
+            if action.get("op") != "set_category":
+                continue
+            try:
+                target = uuid.UUID(str(action.get("value")))
+            except (TypeError, ValueError):
+                target = None
+            if target not in category_ids:
+                errors.append({
+                    "code": "category_missing",
+                    "message": "The category of this rule no longer exists",
+                    "params": {},
+                })
+        out[rule.id] = errors
+    return out
 
 
 # ─── Universal rules (work for any language/country) ───
@@ -676,8 +691,93 @@ async def create_default_rules(
         session.add(rule)
         rules.append(rule)
 
+    # Built-in rules are installed by default in every new workspace.
+    if workspace_id is not None:
+        await install_builtin_pack(session, workspace_id, user_id, BR_CARDS, lang, commit=False)
+
     await session.commit()
     return rules
+
+
+class BuiltinPackResult:
+    __slots__ = ("created", "restored")
+
+    def __init__(self, created: list[Rule], restored: list[Rule]) -> None:
+        self.created = created
+        self.restored = restored
+
+
+async def install_builtin_pack(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    pack_code: str,
+    lang: str = "pt-BR",
+    *,
+    restore: bool = False,
+    commit: bool = True,
+) -> BuiltinPackResult:
+    """Create the pack's missing built-in rules. With ``restore`` the existing
+    ones are reset to their original definition too ("Restore defaults")."""
+    pack = BUILTIN_PACKS[pack_code]
+    existing = {
+        r.builtin_key: r
+        for r in (
+            await session.execute(
+                select(Rule).where(Rule.workspace_id == workspace_id, Rule.builtin_key.is_not(None))
+            )
+        ).scalars().all()
+    }
+    taken_names = await _get_existing_rule_names_for_workspace(session, workspace_id)
+    created: list[Rule] = []
+    restored: list[Rule] = []
+    for spec in pack["rules"]:
+        name = localized(spec["name"], lang)
+        definition = {
+            "conditions_op": spec["conditions_op"],
+            "conditions": [dict(c) for c in spec["conditions"]],
+            "actions": [dict(a) for a in spec["actions"]],
+            "priority": spec["priority"],
+            "is_active": True,
+            "scope_account_kind": "credit_card",
+            "scope_account_id": None,
+            "is_builtin": True,
+        }
+        rule = existing.get(spec["key"])
+        if rule is None:
+            if name in taken_names:
+                name = f"{name} ({spec['key']})"
+            rule = Rule(
+                user_id=user_id, workspace_id=workspace_id, name=name,
+                builtin_key=spec["key"], **definition,
+            )
+            session.add(rule)
+            created.append(rule)
+        elif restore:
+            for key, value in definition.items():
+                setattr(rule, key, value)
+            restored.append(rule)
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
+    return BuiltinPackResult(created, restored)
+
+
+async def builtin_pack_installed(
+    session: AsyncSession, workspace_id: uuid.UUID, pack_code: str
+) -> bool:
+    keys = {
+        row[0]
+        for row in (
+            await session.execute(
+                select(Rule.builtin_key).where(
+                    Rule.workspace_id == workspace_id, Rule.builtin_key.is_not(None)
+                )
+            )
+        ).all()
+    }
+    return {spec["key"] for spec in BUILTIN_PACKS[pack_code]["rules"]} <= keys
 
 
 class RulePackInstallResult:
@@ -943,6 +1043,10 @@ async def export_rules(session: AsyncSession, workspace_id: uuid.UUID) -> RuleEx
             "actions": actions,
             "priority": rule.priority,
             "is_active": rule.is_active,
+            # A rule scoped to one account exports with that account's kind:
+            # the account itself does not exist in another workspace.
+            "scope_account_kind": rule.scope_account_kind,
+            "builtin_key": rule.builtin_key,
         })
     return RuleExportPayload(rules=exported_rules)
 
@@ -997,8 +1101,10 @@ async def import_rules(
             await _validate_rule_definition(
                 session,
                 workspace_id,
-                [condition.model_dump() for condition in incoming.conditions],
+                dump_conditions(incoming.conditions),
                 resolved_actions,
+                conditions_op=incoming.conditions_op,
+                scope_kind=incoming.scope_account_kind,
             )
         except ValueError:
             skipped += 1
@@ -1008,10 +1114,13 @@ async def import_rules(
             workspace_id=workspace_id,
             name=incoming.name,
             conditions_op=incoming.conditions_op,
-            conditions=[condition.model_dump() for condition in incoming.conditions],
+            conditions=dump_conditions(incoming.conditions),
             actions=resolved_actions,
             priority=incoming.priority,
             is_active=incoming.is_active,
+            scope_account_kind=incoming.scope_account_kind,
+            is_builtin=incoming.builtin_key is not None,
+            builtin_key=incoming.builtin_key,
         ))
 
     overwritten = 0
@@ -1044,17 +1153,25 @@ async def create_rule(
     if data.name in existing_names:
         raise DuplicateRuleError(f"A rule named '{data.name}' already exists")
 
-    await _validate_rule_definition(session, workspace_id, data.conditions, data.actions)
+    scope_kind = await resolve_scope(
+        session, workspace_id, data.scope_account_kind, data.scope_account_id
+    )
+    await _validate_rule_definition(
+        session, workspace_id, data.conditions, data.actions,
+        conditions_op=data.conditions_op, scope_kind=scope_kind,
+    )
 
     rule = Rule(
         user_id=user_id,
         workspace_id=workspace_id,
         name=data.name,
         conditions_op=data.conditions_op,
-        conditions=[c.model_dump() for c in data.conditions],
+        conditions=dump_conditions(data.conditions),
         actions=[a.model_dump() for a in data.actions],
         priority=data.priority,
         is_active=data.is_active,
+        scope_account_kind=scope_kind,
+        scope_account_id=data.scope_account_id,
     )
     session.add(rule)
     await session.commit()
@@ -1080,15 +1197,30 @@ async def update_rule(
             raise DuplicateRuleError(f"A rule named '{update_data['name']}' already exists")
 
     if data.conditions is not None:
-        update_data["conditions"] = [c.model_dump() for c in data.conditions]
+        update_data["conditions"] = dump_conditions(data.conditions)
     if data.actions is not None:
         update_data["actions"] = [a.model_dump() for a in data.actions]
+
+    scope_fields = {"scope_account_kind", "scope_account_id"} & update_data.keys()
+    if scope_fields:
+        scope_account_id = update_data.get("scope_account_id", rule.scope_account_id)
+        scope_kind = await resolve_scope(
+            session,
+            workspace_id,
+            update_data.get("scope_account_kind", rule.scope_account_kind),
+            scope_account_id,
+        )
+        update_data["scope_account_kind"] = scope_kind
+    else:
+        scope_kind = rule.scope_account_kind
 
     await _validate_rule_definition(
         session,
         workspace_id,
         update_data.get("conditions", rule.conditions or []),
         update_data.get("actions", rule.actions or []),
+        conditions_op=update_data.get("conditions_op", rule.conditions_op),
+        scope_kind=scope_kind,
     )
 
     for key, value in update_data.items():
@@ -1140,6 +1272,17 @@ _PREVIEW_COLUMNS = (
     Transaction.payee_id,
     Transaction.notes,
     Transaction.is_ignored,
+    Transaction.ignored_reason,
+    Transaction.category_source,
+    Transaction.category_rule_id,
+    Transaction.provider_description_raw,
+    Transaction.merchant_name,
+    Transaction.operation_type,
+    Transaction.provider_category,
+    Transaction.card_number,
+    Transaction.installment_number,
+    Transaction.total_installments,
+    Transaction.payment_type,
 )
 
 
@@ -1163,6 +1306,17 @@ def _rule_preview(transaction: Transaction) -> Transaction:
         payee_id=transaction.payee_id,
         notes=transaction.notes,
         is_ignored=transaction.is_ignored,
+        ignored_reason=transaction.ignored_reason,
+        category_source=transaction.category_source,
+        category_rule_id=transaction.category_rule_id,
+        provider_description_raw=transaction.provider_description_raw,
+        merchant_name=transaction.merchant_name,
+        operation_type=transaction.operation_type,
+        provider_category=transaction.provider_category,
+        card_number=transaction.card_number,
+        installment_number=transaction.installment_number,
+        total_installments=transaction.total_installments,
+        payment_type=transaction.payment_type,
     )
 
 
@@ -1226,17 +1380,56 @@ async def apply_rules_to_transaction(
         if getattr(transaction, "workspace_id", None) is not None
         else None
     )
+    account_type = await _account_type(session, getattr(transaction, "account_id", None))
 
     for rule in rules:
+        if not _rule_usable(rule, getattr(transaction, "account_id", None), account_type):
+            continue
         conditions = rule.conditions or []
         actions = rule.actions or []
-        if evaluate_conditions(rule.conditions_op, conditions, transaction):
+        if evaluate_conditions(rule.conditions_op, conditions, transaction, account_type):
             category_set = apply_rule_actions(
                 actions,
                 transaction,
                 category_set,
                 assignable_category_ids=assignable_categories,
+                rule_id=rule.id,
             )
+
+
+async def _account_type(session: AsyncSession, account_id) -> Optional[str]:
+    if account_id is None:
+        return None
+    return await session.scalar(select(Account.type).where(Account.id == account_id))
+
+
+def _rule_usable(rule: Rule, account_id, account_type: Optional[str]) -> bool:
+    """In scope for the row's account and free of definition errors: an
+    invalid rule is skipped, never fatal (AC-3.13)."""
+    if not rule_in_scope(rule, account_id, account_type):
+        return False
+    return not rule_definition_errors(
+        getattr(rule, "scope_account_kind", None),
+        rule.conditions_op,
+        rule.conditions or [],
+        rule.actions or [],
+    )
+
+
+def _category_is_sticky(tx: Transaction, overwrite_manual: bool) -> bool:
+    """A manual category (or one of unknown provenance, from before Rules v2)
+    is the user's: rules only replace it when explicitly asked to."""
+    if overwrite_manual:
+        return False
+    source = getattr(tx, "category_source", None)
+    return source == "manual" or (source is None and tx.category_id is not None)
+
+
+async def _account_types(session: AsyncSession, workspace_id: uuid.UUID) -> dict:
+    rows = await session.execute(
+        select(Account.id, Account.type).where(Account.workspace_id == workspace_id)
+    )
+    return {row[0]: row[1] for row in rows}
 
 
 def _rule_effect_state(tx: Transaction) -> tuple:
@@ -1267,6 +1460,8 @@ async def preview_rule(
     overwrite_existing_categories: bool = False,
     limit: int = 20,
     offset: int = 0,
+    scope_account_kind: Optional[str] = None,
+    scope_account_id: Optional[uuid.UUID] = None,
 ) -> RulePreviewResponse:
     """Report which existing transactions an unsaved rule would match.
 
@@ -1286,7 +1481,13 @@ async def preview_rule(
     changing, because saving would change nothing.
     """
     will_apply = is_active and apply_to_existing
-    await _validate_rule_definition(session, workspace_id, conditions, actions or [])
+    scope_kind = await resolve_scope(session, workspace_id, scope_account_kind, scope_account_id)
+    await _validate_rule_definition(
+        session, workspace_id, conditions, actions or [],
+        conditions_op=conditions_op, scope_kind=scope_kind,
+    )
+    scope = Rule(scope_account_kind=scope_kind, scope_account_id=scope_account_id)
+    account_types = await _account_types(session, workspace_id)
 
     # Every transaction is evaluated in Python, so only the columns the engine
     # reads and `_rule_preview` copies are worth fetching — notably not
@@ -1324,13 +1525,18 @@ async def preview_rule(
     sample: list[RulePreviewItem] = []
 
     for tx in transactions:
-        matches = evaluate_conditions(conditions_op, conditions or [], tx)
+        account_type = account_types.get(tx.account_id)
+        if not rule_in_scope(scope, tx.account_id, account_type):
+            continue
+        matches = evaluate_conditions(conditions_op, conditions or [], tx, account_type)
         # A rule that renamed this row before should still recognise it, so a
         # miss is retried against the original text — same as apply_single_rule.
         if not matches and tx.original_description is not None:
             original_target = _rule_preview(tx)
             original_target.description = tx.original_description
-            matches = evaluate_conditions(conditions_op, conditions or [], original_target)
+            matches = evaluate_conditions(
+                conditions_op, conditions or [], original_target, account_type
+            )
         if not matches:
             continue
         matched += 1
@@ -1343,8 +1549,7 @@ async def preview_rule(
             apply_rule_actions(
                 action_dicts,
                 draft,
-                category_already_set=tx.category_id is not None
-                and not overwrite_existing_categories,
+                category_already_set=_category_is_sticky(tx, overwrite_existing_categories),
                 skip_description=_has_manual_description(tx),
                 assignable_category_ids=assignable_categories,
             )
@@ -1410,14 +1615,18 @@ async def apply_single_rule(
     actions = rule.actions or []
 
     assignable_categories = await get_assignable_category_ids(session, workspace_id)
+    account_types = await _account_types(session, workspace_id)
     count = 0
     for tx in transactions:
-        matches = evaluate_conditions(rule.conditions_op, conditions, tx)
+        account_type = account_types.get(tx.account_id)
+        if not _rule_usable(rule, tx.account_id, account_type):
+            continue
+        matches = evaluate_conditions(rule.conditions_op, conditions, tx, account_type)
         if not matches and tx.original_description is not None:
             original_target = _rule_preview(tx)
             original_target.description = tx.original_description
             matches = evaluate_conditions(
-                rule.conditions_op, conditions, original_target
+                rule.conditions_op, conditions, original_target, account_type
             )
         if not matches:
             continue
@@ -1434,10 +1643,10 @@ async def apply_single_rule(
         apply_rule_actions(
             actions,
             tx,
-            category_already_set=tx.category_id is not None
-            and not overwrite_existing_categories,
+            category_already_set=_category_is_sticky(tx, overwrite_existing_categories),
             skip_description=_has_manual_description(tx),
             assignable_category_ids=assignable_categories,
+            rule_id=rule.id,
         )
         after = (
             tx.category_id,
@@ -1473,8 +1682,10 @@ async def apply_all_rules(session: AsyncSession, workspace_id: uuid.UUID) -> int
     rules = rules_result.scalars().all()
 
     assignable_categories = await get_assignable_category_ids(session, workspace_id)
+    account_types = await _account_types(session, workspace_id)
     count = 0
     for tx in transactions:
+        account_type = account_types.get(tx.account_id)
         preserve_manual_description = _has_manual_description(tx)
         before = (
             tx.category_id,
@@ -1492,11 +1703,15 @@ async def apply_all_rules(session: AsyncSession, workspace_id: uuid.UUID) -> int
         matched = False
         category_set = False
         for rule in rules:
+            if not _rule_usable(rule, tx.account_id, account_type):
+                continue
             conditions = rule.conditions or []
             actions = rule.actions or []
-            if evaluate_conditions(rule.conditions_op, conditions, tx):
+            if evaluate_conditions(rule.conditions_op, conditions, tx, account_type):
                 if not matched:
                     tx.category_id = None
+                    tx.category_source = None
+                    tx.category_rule_id = None
                     tx.notes = None
                     matched = True
                 category_set = apply_rule_actions(
@@ -1505,6 +1720,7 @@ async def apply_all_rules(session: AsyncSession, workspace_id: uuid.UUID) -> int
                     category_set,
                     skip_description=preserve_manual_description,
                     assignable_category_ids=assignable_categories,
+                    rule_id=rule.id,
                 )
 
         after = (
@@ -1521,3 +1737,60 @@ async def apply_all_rules(session: AsyncSession, workspace_id: uuid.UUID) -> int
 
     await session.commit()
     return count
+
+
+# --- Recompute after rule changes (RFC toledo-features §5.1, AC-3.8) ---------
+
+# Above this many accounts a rule change is recomputed in the background.
+INLINE_RECOMPUTE_ACCOUNTS = 25
+
+
+async def accounts_in_scopes(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    scopes: list[tuple[Optional[str], Optional[uuid.UUID]]],
+) -> list[uuid.UUID]:
+    """Accounts a rule reaches through any of its (old and new) scopes."""
+    accounts = (
+        await session.execute(
+            select(Account.id, Account.type).where(Account.workspace_id == workspace_id)
+        )
+    ).all()
+    reached = []
+    for account_id, account_type in accounts:
+        for kind, scoped_id in scopes:
+            probe = Rule(scope_account_kind=kind, scope_account_id=scoped_id)
+            if rule_in_scope(probe, account_id, account_type):
+                reached.append(account_id)
+                break
+    return reached
+
+
+async def recompute_rule_scopes(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    scopes: list[tuple[Optional[str], Optional[uuid.UUID]]],
+) -> int:
+    """Recompute every account a rule change reaches. Inline (returns the
+    number of rows that changed) for a few accounts, otherwise dispatched to
+    the ``recompute_workspace`` Celery task (returns 0). The count is the
+    rows whose category or card line kind moved — the rule's own effect."""
+    from app.services.recompute_service import recompute_accounts
+
+    account_ids = await accounts_in_scopes(session, workspace_id, scopes)
+    if not account_ids:
+        return 0
+    if len(account_ids) > INLINE_RECOMPUTE_ACCOUNTS:
+        try:
+            from app.worker import celery_app
+
+            celery_app.send_task(
+                "app.tasks.recompute_tasks.recompute_workspace",
+                args=[str(workspace_id), [str(a) for a in account_ids]],
+            )
+            return 0
+        except Exception:  # noqa: BLE001 — no broker: do it now
+            pass
+    stats = await recompute_accounts(session, account_ids)
+    await session.commit()
+    return len(set().union(*(s.rule_effect_ids for s in stats)))

@@ -3,11 +3,25 @@ from datetime import date as _date, datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Optional, cast
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, JSON, Numeric, SmallInteger, String, event
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, JSON, Numeric, SmallInteger, String, event, text
+from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.types import TypeDecorator
 
 from app.core.database import Base
+
+
+class _UUIDListJSON(TypeDecorator):
+    """A list of UUIDs as JSON text — the SQLite stand-in for uuid[]."""
+
+    impl = JSON
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return [str(v) for v in value] if value is not None else None
+
+    def process_result_value(self, value, dialect):
+        return [uuid.UUID(str(v)) for v in value] if value is not None else None
 
 if TYPE_CHECKING:
     from app.models.account import Account
@@ -115,6 +129,104 @@ class Transaction(Base):
         nullable=True,
         index=True,
     )
+    # --- Provider capture (RFC toledo-features §4.3). Provider-owned: sync
+    # rewrites them from the latest payload; the whole payload stays in
+    # raw_data too. Only Pluggy fills them today.
+    # Institution's own stable id (Open Finance). Survives Pluggy's
+    # delete+recreate of a row, so it re-keys external_id (§4.5).
+    provider_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    provider_code: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    provider_created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    provider_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    provider_description_raw: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    operation_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    provider_category: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    provider_category_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    merchant_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    merchant_cnpj: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    merchant_mcc: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    card_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # SINGLE / INSTALLMENT (credit card). SINGLE with an n/N counter is not
+    # an installment purchase.
+    payment_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # Purchase timestamp to the second, when the bank sends one.
+    transaction_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The bill link as Pluggy sent it, even before that bill row is stored.
+    provider_bill_external_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # First day of the month Pluggy forecasts for an open-bill purchase.
+    bill_forecast_month: Mapped[Optional[_date]] = mapped_column(Date, nullable=True)
+    bill_post_date: Mapped[Optional[_date]] = mapped_column(Date, nullable=True)
+    amount_in_account_currency: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(precision=15, scale=2), nullable=True
+    )
+    balance_after: Mapped[Optional[Decimal]] = mapped_column(Numeric(precision=15, scale=2), nullable=True)
+    payment_data: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # "Don't update from the bank": only raw_data and provider_* columns are
+    # refreshed while set; every visible field stays as the user left it.
+    sync_locked: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Why is_ignored is set: 'user' (or null on legacy rows), or one of the
+    # automatic reasons 'provider_removed' / 'duplicate' that sync and
+    # recompute set and clear on their own (§4.7).
+    ignored_reason: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    provider_removed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    duplicate_of_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("transactions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # The user said "not a duplicate": recompute never flags the row again.
+    duplicate_override: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # --- Classification provenance (RFC §5.3). category_source: 'provider'
+    # (provider category mapping), 'manual' (the user's choice, sticky),
+    # 'rule' (category_rule_id while that rule still matches), or null.
+    category_source: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    category_rule_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("rules.id", ondelete="SET NULL"), nullable=True
+    )
+    # Card statement role of a credit-card row: purchase | credit | payment |
+    # previous_balance. Derived by recompute (rule or default), never typed.
+    card_line_kind: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    card_line_kind_source: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    card_line_kind_rule_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("rules.id", ondelete="SET NULL"), nullable=True
+    )
+    # Why a kind was overridden by recompute itself: 'carried_over' (a credit
+    # the bank repeats from the previous bill, counted as previous balance).
+    card_line_kind_reason: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # Why effective_date is what it is (§6.2): manual | bill | forecast |
+    # post_date | cycle | tx_date. Null on rows recompute has not seen yet.
+    effective_date_source: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    # --- Installment plans (RFC §7.2). Derived by recompute: the plan, how
+    # the parcel is linked (auto | conflict | manual) and why it conflicts.
+    installment_plan_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("installment_plans.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    installment_link: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    # {"code": "month" | "amount", "expected": ...} — i18n key + params.
+    installment_issue: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # The user's decision: this parcel belongs to that plan. Recompute
+    # respects it and never re-evaluates the row.
+    installment_plan_manual_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("installment_plans.id", ondelete="SET NULL"), nullable=True
+    )
+    # --- Recurrences v2 (RFC §8.2). Derived by recompute: the period the row
+    # fulfills (nominal date), how it is linked (auto | conflict | manual),
+    # why it conflicts, and whether it is the IOF line of a foreign charge.
+    recurring_period: Mapped[Optional[_date]] = mapped_column(Date, nullable=True)
+    recurring_link: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    recurring_issue: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    recurring_companion: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Decisions — sync never touches them (INV-2).
+    recurring_manual_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("recurring_transactions.id", ondelete="SET NULL"), nullable=True
+    )
+    recurring_manual_none: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    recurring_manual_excluded: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    recurring_rejected_ids: Mapped[Optional[list]] = mapped_column(
+        ARRAY(UUID(as_uuid=True)).with_variant(_UUIDListJSON(), "sqlite"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     account: Mapped["Account"] = relationship(back_populates="transactions")
@@ -122,7 +234,7 @@ class Transaction(Base):
     bill: Mapped[Optional["CreditCardBill"]] = relationship()
     payee_entity: Mapped[Optional["Payee"]] = relationship(back_populates="transactions")
     recurring_transaction: Mapped[Optional["RecurringTransaction"]] = relationship(
-        back_populates="transactions"
+        back_populates="transactions", foreign_keys=[recurring_transaction_id]
     )
     import_log: Mapped[Optional["ImportLog"]] = relationship(back_populates="transactions")
     attachments: Mapped[list["TransactionAttachment"]] = relationship(
@@ -130,6 +242,15 @@ class Transaction(Base):
     )
     splits: Mapped[list["TransactionSplit"]] = relationship(
         back_populates="transaction", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_transactions_account_provider_id",
+            "account_id",
+            "provider_id",
+            postgresql_where=text("provider_id IS NOT NULL"),
+        ),
     )
 
     # Populated dynamically by the service (not DB columns).

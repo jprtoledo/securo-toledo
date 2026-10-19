@@ -1,9 +1,9 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, SmallInteger, String
+from sqlalchemy import JSON, Boolean, Date, DateTime, ForeignKey, Numeric, SmallInteger, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -50,6 +50,26 @@ class Account(Base):
         UUID(as_uuid=True), ForeignKey("institutions.id", ondelete="SET NULL"),
         nullable=True, index=True,
     )
+    # Provider snapshot (RFC toledo-features §4.3; Pluggy creditData/bankData).
+    available_credit_limit: Mapped[Optional[Decimal]] = mapped_column(Numeric(precision=15, scale=2), nullable=True)
+    balance_close_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    balance_due_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    overdraft_limit: Mapped[Optional[Decimal]] = mapped_column(Numeric(precision=15, scale=2), nullable=True)
+    overdraft_used: Mapped[Optional[Decimal]] = mapped_column(Numeric(precision=15, scale=2), nullable=True)
+    card_holder_type: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    # Max provider createdAt seen for the account; the next incremental sync
+    # re-reads everything the provider ingested since (minus 24 h).
+    provider_tx_created_watermark: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Credit cards (RFC toledo-features §6.3): statement_close_day and
+    # payment_due_day are derived from the bills unless the user typed them,
+    # which sets cycle_days_manual and stops the derivation.
+    cycle_days_manual: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Learned by recompute: month offset of Pluggy's bill forecast and the
+    # measured accuracy/order of the open-bill fallbacks (§6.2).
+    forecast_offset_months: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
+    resolution_stats: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     is_closed: Mapped[bool] = mapped_column(Boolean, default=False)
     closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 

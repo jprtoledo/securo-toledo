@@ -5,7 +5,7 @@ import { ConnectorSelectDialog } from './connector-select-dialog'
 import { OAuthConnectDialog } from './oauth-connect-dialog'
 import { BankConnectDialog } from './bank-connect-dialog'
 
-const api = vi.hoisted(() => ({ getProviders: vi.fn(), listInstitutions: vi.fn(), getReconnectToken: vi.fn(), getConnectToken: vi.fn(), toastError: vi.fn() }))
+const api = vi.hoisted(() => ({ getProviders: vi.fn(), listInstitutions: vi.fn(), getReconnectToken: vi.fn(), getConnectToken: vi.fn(), pluggyCredentials: vi.fn(), toastError: vi.fn() }))
 vi.mock('@/lib/api', () => ({ connections: api, auth: api }))
 vi.mock('sonner', () => ({ toast: { error: api.toastError } }))
 vi.mock('react-pluggy-connect', () => ({ PluggyConnect: ({ connectToken }: { connectToken: string }) => <div>{connectToken}</div> }))
@@ -76,4 +76,26 @@ it('ignores token failures after the bank dialog closes', async () => {
   await act(async () => { reject(new Error('late failure')) })
   expect(onClose).not.toHaveBeenCalled()
   expect(api.toastError).not.toHaveBeenCalled()
+})
+
+it('AC-1.5 asks which Pluggy application to use when there are several', async () => {
+  api.pluggyCredentials.mockResolvedValue([{ id: 'a', name: 'Personal' }, { id: 'b', name: 'Family' }])
+  api.getConnectToken.mockResolvedValue('token-b')
+  const { user } = renderWithProviders(<BankConnectDialog open provider="pluggy" onClose={vi.fn()} />)
+  const continueButton = await screen.findByRole('button', { name: 'Continue to connector' })
+  expect(continueButton).toBeDisabled()
+  expect(api.getConnectToken).not.toHaveBeenCalled()
+  await user.click(screen.getByText('Family'))
+  await user.click(continueButton)
+  expect(await screen.findByText('token-b')).toBeInTheDocument()
+  expect(api.getConnectToken).toHaveBeenCalledWith('pluggy', 'b')
+})
+
+it('AC-1.5 uses the only Pluggy application without asking', async () => {
+  api.pluggyCredentials.mockResolvedValue([{ id: 'a', name: 'Personal' }])
+  api.getConnectToken.mockResolvedValue('token-a')
+  renderWithProviders(<BankConnectDialog open provider="pluggy" onClose={vi.fn()} />)
+  expect(await screen.findByText('token-a')).toBeInTheDocument()
+  expect(api.getConnectToken).toHaveBeenCalledWith('pluggy', undefined)
+  expect(screen.queryByText('Personal')).not.toBeInTheDocument()
 })

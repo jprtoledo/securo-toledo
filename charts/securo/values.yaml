@@ -19,7 +19,12 @@ secret:
   # If postgresql.enabled is false, you must provide your external database URL here or in existingSecret.
   databaseUrl: 'postgresql+asyncpg://postgres:postgres@{{ include "securo.fullname" . }}-postgresql:5432/securo'
 
-  # Pluggy
+  # Encrypts secrets stored in the database (Pluggy applications).
+  # 32 bytes, base64 or hex: `openssl rand -base64 32`. Back it up.
+  credentialsEncryptionKey: ""
+
+  # Pluggy — only read on first start, to store them as the "Default"
+  # application; manage applications in Admin → Pluggy applications.
   pluggyClientId: ""
   pluggyClientSecret: ""
 
@@ -47,6 +52,7 @@ config:
   localAuthEnabled: "true"
   # Leave empty to auto-compute from global.domain (e.g. http://securo.local/oauth/callback)
   pluggyOauthRedirectUri: ""
+  pluggySyncLookbackDays: "60"
   enableBankingApiUrl: "https://api.enablebanking.com"
   # Leave empty to auto-compute from global.domain
   enableBankingOauthRedirectUri: ""

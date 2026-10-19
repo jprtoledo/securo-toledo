@@ -147,6 +147,38 @@ export interface BankConnection {
   // Institutions this link spans (issue #345). Empty for one-institution
   // providers — institution_name covers those.
   institutions: ConnectionInstitution[]
+  // Pluggy: the Pluggy application (credential) the connection uses.
+  pluggy_credential_id?: string | null
+  // Provider-side item snapshot, informational (RFC toledo-features §4.3).
+  provider_status?: string | null
+  provider_execution_status?: string | null
+  provider_last_updated_at?: string | null
+  consent_expires_at?: string | null
+}
+
+// A Pluggy application as any member sees it (names only).
+export interface PluggyCredentialOption {
+  id: string
+  name: string
+}
+
+// A Pluggy application as the admin page sees it. The keys never leave the
+// backend: only a hint of the client id.
+export interface PluggyCredential {
+  id: string
+  name: string
+  client_id_hint: string
+  connection_count: number
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface PluggyStatus {
+  configured: boolean
+  encryption_key_configured: boolean
+  reason: string | null
+  credential_count: number
 }
 
 export interface ConnectionSettings {
@@ -303,6 +335,45 @@ export interface Transaction {
   // Keeps the transaction in the ledger/balance while excluding it from P&L.
   exclude_from_pnl?: boolean
   virtual?: boolean
+  // Sync state (RFC toledo-features §4.6–§4.7). `ignored_reason` says why
+  // is_ignored is set: 'user' (or null), 'provider_removed', 'duplicate'.
+  ignored_reason?: 'user' | 'provider_removed' | 'duplicate' | null
+  provider_removed_at?: string | null
+  duplicate_of_id?: string | null
+  duplicate_override?: boolean
+  sync_locked?: boolean
+  // Read-only provider information (§4.3).
+  provider_id?: string | null
+  operation_type?: string | null
+  card_number?: string | null
+  merchant_name?: string | null
+  merchant_mcc?: string | null
+  provider_category?: string | null
+  provider_bill_external_id?: string | null
+  payment_type?: string | null
+  provider_description_raw?: string | null
+  // Explanations (RFC §5.3, §6.2)
+  category_source?: 'provider' | 'manual' | 'rule' | null
+  category_rule_id?: string | null
+  card_line_kind?: 'purchase' | 'credit' | 'payment' | 'previous_balance' | null
+  card_line_kind_source?: 'rule' | 'default' | null
+  card_line_kind_reason?: string | null
+  effective_date?: string | null
+  effective_date_source?: 'manual' | 'bill' | 'forecast' | 'post_date' | 'cycle' | 'tx_date' | null
+  // Installment plan (RFC §7)
+  installment_plan_id?: string | null
+  installment_link?: 'auto' | 'conflict' | 'manual' | null
+  installment_issue?: { code: 'month' | 'amount'; expected: string } | null
+  installment_plan_manual_id?: string | null
+  // Recurrences v2 (RFC §8.2)
+  recurring_period?: string | null
+  recurring_link?: 'auto' | 'conflict' | 'manual' | null
+  recurring_issue?: { code: 'amount_changed' | 'double_charge'; charged?: string; expected?: string } | null
+  recurring_companion?: boolean
+  recurring_manual_id?: string | null
+  recurring_manual_none?: boolean
+  recurring_manual_excluded?: boolean
+  recurring_rejected_ids?: string[] | null
 }
 
 // Scope for installment-series edits/deletes: "this" (default) only touches
@@ -475,26 +546,38 @@ export interface PayeeSummary {
 export interface RuleCondition {
   field: string
   op: string
-  value: string | number
+  // A list for in/not_in; absent for is_empty/is_not_empty.
+  value?: string | number | (string | number)[] | null
 }
 
-/** A nested group of conditions joined by its own operator.
- *
- * Groups let a rule mix AND and OR — `type is debit AND (contains UBER OR
- * contains 99POP)`. They hold leaf conditions only, capping rule depth at the
- * two levels the engine evaluates and the editor exposes.
- */
+/** A nested group of conditions joined by its own operator. Groups nest to
+ *  any depth up to 5 (Rules v2), alongside negations. */
 export interface RuleConditionGroup {
   op: 'and' | 'or'
-  conditions: RuleCondition[]
+  conditions: RuleConditionNode[]
 }
 
-/** An entry of a rule's condition list: a leaf condition or one group. */
-export type RuleConditionNode = RuleCondition | RuleConditionGroup
+/** `{not: node}` — matches when the node does not. */
+export interface RuleConditionNot {
+  not: RuleConditionNode
+}
+
+/** A condition node: a leaf, a group or a negation. */
+export type RuleConditionNode = RuleCondition | RuleConditionGroup | RuleConditionNot
 
 export interface RuleAction {
   op: string
-  value: string
+  value?: string | null
+}
+
+export type RuleScopeKind = 'bank' | 'credit_card'
+
+/** Why the engine skips a rule (RFC toledo-features §5.3). `code` keys
+ *  `rules.errors.<code>`; `message` is the backend's English fallback. */
+export interface RuleError {
+  code: string
+  message: string
+  params?: Record<string, unknown>
 }
 
 export interface Rule {
@@ -506,6 +589,11 @@ export interface Rule {
   actions: RuleAction[]
   priority: number
   is_active: boolean
+  scope_account_kind?: RuleScopeKind | null
+  scope_account_id?: string | null
+  is_builtin?: boolean
+  builtin_key?: string | null
+  errors?: RuleError[]
   apply_to_existing?: boolean
   overwrite_existing_categories?: boolean
 }
@@ -517,6 +605,8 @@ export interface RuleExportItem {
   actions: RuleAction[]
   priority: number
   is_active: boolean
+  scope_account_kind?: RuleScopeKind | null
+  builtin_key?: string | null
 }
 
 export interface RuleExportPayload {
@@ -617,7 +707,7 @@ export interface RecurringTransaction {
   amount: number
   currency: string
   type: 'debit' | 'credit'
-  frequency: 'monthly' | 'quarterly' | 'semiannual' | 'weekly' | 'biweekly' | 'yearly'
+  frequency: 'monthly' | 'quarterly' | 'semiannual' | 'weekly' | 'biweekly' | 'yearly' | 'weekly_billed_monthly'
   weekend_adjustment: 'none' | 'previous_friday' | 'next_monday'
   day_of_month: number | null
   start_date: string
@@ -627,6 +717,60 @@ export interface RecurringTransaction {
   next_occurrence: string
   amount_primary: number | null
   fx_rate_used: number | null
+  // Recurrences v2 (RFC toledo-features §8.2)
+  match_condition?: RuleConditionNode | null
+  amount_mode?: 'fixed' | 'variable'
+  amount_tolerance_pct?: number | string
+  day_window?: number | null
+  billing_weekday?: number | null
+  week_count_basis?: 'previous_month' | 'same_month' | null
+  origin?: 'manual' | 'suggestion' | 'import'
+  import_ref?: string | null
+  timeline?: RecurrenceSlot[] | null
+  alerts?: RecurrenceAlerts | null
+  next?: RecurrenceSlot | null
+  link_stats?: { recurrences: number; linked: number; recurring_conflicts: number } | null
+  // Other accounts that may pay a period; the forecast stays on account_id.
+  extra_account_ids?: string[] | null
+}
+
+export interface RecurrenceSlot {
+  period: string
+  status: 'posted' | 'conflict' | 'expected' | 'late' | 'missed' | 'skipped'
+  expected_date: string
+  month: string
+  amount: number | string | null
+  expected_amount: number | string
+  transaction_ids: string[]
+  conflict_ids: string[]
+  excluded: boolean
+  // The account that paid a posted/conflict slot.
+  account_id?: string | null
+}
+
+export interface RecurrenceAlerts {
+  conflicts: number
+  last_missed: string | null
+  missed_streak: number
+  suggest_end: boolean
+}
+
+export interface RecurringSuggestion {
+  key: string
+  description: string
+  type: 'debit' | 'credit'
+  currency: string
+  amount_mode: 'fixed' | 'variable'
+  amount: number | string
+  amount_tolerance_pct: number | string
+  frequency: RecurringTransaction['frequency']
+  day_of_month: number | null
+  day_window: number
+  start_date: string
+  match_condition: RuleConditionNode
+  occurrences: { id: string; date: string; amount: number | string }[]
+  periods_covered: number
+  account_id: string
 }
 
 export interface ProjectedTransaction {
@@ -745,8 +889,11 @@ export interface DailyBalance {
 }
 
 export interface BalanceHistory {
-  current: DailyBalance[]
-  previous: DailyBalance[]
+  // Money in the accounts; cards leave on each bill's due date.
+  current: DailyBalance[] // actual, up to today
+  previous: DailyBalance[] // the month before; empty for a future month
+  forecast?: DailyBalance[] // from today on
+  start_balance?: number | null // end of the day before the month
 }
 
 export interface Budget {
@@ -1020,6 +1167,10 @@ export interface ReportMeta {
   runway_date?: string | null
   lowest_balance?: number | null
   lowest_balance_date?: string | null
+  // Reference date ± span windows.
+  reference_date?: string | null
+  window_start?: string | null
+  window_end?: string | null
 }
 
 export interface ReportCompositionItem {
@@ -1777,4 +1928,107 @@ export interface ReconciliationHistoryEvent {
   user_id?: string | null
   transaction_id?: string | null
   transaction_description?: string | null
+}
+
+// --- Credit-card statements (RFC toledo-features §6.4) ----------------------
+
+export type StatementState = 'closed' | 'closed_estimated' | 'open' | 'future'
+export type StatementStatus = 'paid' | 'due' | 'overdue' | 'nothing_due' | 'not_closed' | 'unknown'
+
+export interface CardStatement {
+  month: string
+  state: StatementState
+  status: StatementStatus
+  bill_id: string | null
+  closing_date: string | null
+  due_date: string | null
+  dates_estimated: boolean
+  total: number
+  total_estimated: boolean
+  posted_total: number
+  spent: number
+  prepaid: number
+  paid: number
+  paid_at: string | null
+  payments: { date: string; amount: number }[]
+  minimum_payment: number | null
+  finance_charges: number
+  reconciliation: { computed: number; diff: number } | null
+  history: 'before' | 'first' | null
+  purchase_count: number
+  projected_installments: number
+  projected_installment_count: number
+  projected_recurring: number
+  projected_recurring_count: number
+  // What the projections are, listed on the account page (open/future only).
+  projected_items?: CardProjectedItem[]
+}
+
+export interface CardProjectedItem {
+  source: 'installment' | 'recurrence'
+  amount: number | string // positive = adds to the bill
+  description: string
+  number?: number
+  total?: number
+  ref_id: string
+  category_id: string | null
+  date?: string
+}
+
+export interface CardResolutionStats {
+  truth_samples: number
+  forecast_offset_months: number
+  methods: Record<string, { samples: number; hits: number }>
+  fallback_order: string[]
+}
+
+export interface CardStatementsResponse {
+  account_id: string
+  today: string
+  open_month: string
+  closing_day: number | null
+  due_day: number | null
+  cycle_days_manual: boolean
+  resolution_stats: CardResolutionStats | null
+  // True for Pluggy cards: their months are reference months.
+  reference_months?: boolean
+  statements: CardStatement[]
+}
+
+// --- Installment plans (RFC toledo-features §7.3) ---------------------------
+
+export interface InstallmentPlanParcel {
+  number: number
+  month: string
+  amount: number
+  kind: 'posted' | 'projected' | 'missing' | 'before_history'
+  transaction_id: string | null
+  pending: boolean
+  link: 'auto' | 'conflict' | 'manual' | null
+  issue: { code: 'month' | 'amount'; expected: string } | null
+}
+
+export interface InstallmentPlanView {
+  id: string
+  source: 'detected' | 'manual' | 'series'
+  description: string
+  purchase_date: string | null
+  total_installments: number
+  installment_amount: number
+  total_amount: number
+  first_month: string
+  last_month: string
+  current_installment: number
+  remaining: number
+  active: boolean
+  conflicts: number
+  missing: number
+  category_id: string | null
+  installments: InstallmentPlanParcel[]
+}
+
+export interface InstallmentPlansResponse {
+  open_month: string
+  alerts: { conflicts: number; missing: number }
+  plans: InstallmentPlanView[]
 }

@@ -480,7 +480,7 @@ async def test_dashboard_projected_transactions(
     await client.post(
         "/api/recurring-transactions",
         headers=auth_headers,
-        json={
+        json={"auto_generate": True, 
             "description": "Proj Test",
             "amount": 100,
             "type": "debit",

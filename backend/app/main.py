@@ -7,6 +7,7 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.accounts import router as accounts_router
+from app.api.installment_plans import router as installment_plans_router
 from app.api.budgets import router as budgets_router
 from app.api.goals import router as goals_router
 from app.api.groups import router as groups_router
@@ -92,8 +93,24 @@ async def _warm_tesouro_cache() -> None:
         logger.exception("Startup: Tesouro Direto cache warm failed")
 
 
+async def _bootstrap_pluggy_credentials() -> None:
+    """Store PLUGGY_CLIENT_ID/SECRET as the "Default" Pluggy application on
+    the first start after the upgrade, and bind existing Pluggy connections
+    to it. Idempotent; never blocks startup."""
+    try:
+        from app.core.database import async_session_maker
+        from app.services.pluggy_credential_service import bootstrap_from_env
+
+        async with async_session_maker() as session:
+            await bootstrap_from_env(session)
+    except Exception:
+        logger.exception("Startup: Pluggy credential bootstrap failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Before the first sync is dispatched, so it finds its credential.
+    await _bootstrap_pluggy_credentials()
     # Startup: dispatch sync for all stale bank connections
     try:
         from app.worker import celery_app  # noqa: F811
@@ -178,6 +195,7 @@ app.include_router(transactions_router)
 app.include_router(import_router)
 app.include_router(import_logs_router)
 app.include_router(accounts_router)
+app.include_router(installment_plans_router)
 app.include_router(connections_router)
 app.include_router(recurring_router)
 app.include_router(budgets_router)

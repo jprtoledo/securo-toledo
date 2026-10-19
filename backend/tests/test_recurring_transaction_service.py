@@ -50,6 +50,7 @@ async def test_create_recurring_transaction(
     session: AsyncSession, test_user, test_workspace, test_account_for_recurring
 ):
     data = RecurringTransactionCreate(
+        auto_generate=True,
         description="Netflix",
         amount=Decimal("39.90"),
         type="debit",
@@ -70,6 +71,7 @@ async def test_create_recurring_transaction(
 @pytest.mark.asyncio
 async def test_create_with_skip_first(session: AsyncSession, test_user, test_workspace, test_account_for_recurring):
     data = RecurringTransactionCreate(
+        auto_generate=True,
         description="Rent",
         amount=Decimal("2000"),
         type="debit",
@@ -94,6 +96,7 @@ async def test_get_recurring_transactions(
             session,
             test_workspace.id, test_user.id,
             RecurringTransactionCreate(
+                auto_generate=True,
                 description=desc,
                 amount=Decimal("10"),
                 type="debit",
@@ -119,6 +122,7 @@ async def test_get_recurring_transaction_by_id(
         session,
         test_workspace.id, test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description="Lookup",
             amount=Decimal("50"),
             type="debit",
@@ -146,6 +150,7 @@ async def test_update_recurring_transaction(
         session,
         test_workspace.id, test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description="Old",
             amount=Decimal("100"),
             type="debit",
@@ -173,6 +178,7 @@ async def _monthly_rule(
     return await create_recurring_transaction(
         session, test_workspace.id, test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description="Rule",
             amount=Decimal("100"),
             type="debit",
@@ -261,6 +267,7 @@ def test_schemas_reject_day_of_month_outside_calendar(day):
         RecurringTransactionUpdate(day_of_month=day)
     with pytest.raises(ValidationError):
         RecurringTransactionCreate(
+            auto_generate=True,
             description="Rule", amount=Decimal("1"), type="debit", frequency="monthly",
             start_date=date(2026, 1, 1), account_id=uuid.uuid4(), day_of_month=day,
         )
@@ -314,6 +321,7 @@ async def test_delete_recurring_transaction(
         session,
         test_workspace.id, test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description="ToDelete",
             amount=Decimal("10"),
             type="debit",
@@ -752,6 +760,7 @@ async def test_generate_pending(session: AsyncSession, test_user, test_workspace
         session,
         test_workspace.id, test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description="Monthly Sub",
             amount=Decimal("29.90"),
             type="debit",
@@ -811,6 +820,7 @@ async def test_generate_pending_holds_synced_account_rows_pending(
         session,
         test_workspace.id, test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description="Synced Sub",
             amount=Decimal("10"),
             type="debit",
@@ -837,6 +847,7 @@ async def test_generate_pending_quarterly_respects_end_date(
         test_workspace.id,
         test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description="Quarterly Insurance",
             amount=Decimal("300"),
             type="debit",
@@ -917,6 +928,7 @@ async def test_generate_pending_new_frequencies(
         test_workspace.id,
         test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description=f"{frequency} regression",
             amount=Decimal("25"),
             type="debit",
@@ -947,6 +959,7 @@ async def test_generate_pending_deactivates_past_end_date(
         session,
         test_workspace.id, test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description="Short Sub",
             amount=Decimal("10"),
             type="debit",
@@ -973,6 +986,7 @@ async def test_generate_pending_no_duplicates(
         session,
         test_workspace.id, test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description="NoDup",
             amount=Decimal("5"),
             type="debit",
@@ -999,6 +1013,7 @@ async def test_generate_pending_previous_friday_uses_effective_cutoff_and_date(
         test_workspace.id,
         test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description="Weekend rent",
             amount=Decimal("1000"),
             type="debit",
@@ -1029,6 +1044,7 @@ async def test_generate_pending_next_monday_waits_until_effective_date(
         test_workspace.id,
         test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description="Weekend salary",
             amount=Decimal("2000"),
             type="credit",
@@ -1063,6 +1079,7 @@ async def test_generate_pending_weekend_adjustment_respects_nominal_end_date(
         test_workspace.id,
         test_user.id,
         RecurringTransactionCreate(
+            auto_generate=True,
             description="Final weekend bill",
             amount=Decimal("50"),
             type="debit",

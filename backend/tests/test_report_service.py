@@ -1771,94 +1771,61 @@ async def _set_accounting_mode(session: AsyncSession, mode: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cash_flow_cash_mode_uses_transaction_date(
+async def test_cash_flow_card_purchase_leaves_cash_on_next_due_date(
     session: AsyncSession, test_user, test_workspace: User
 ):
-    """In cash mode: a CC purchase made today (effective_date in future) is
-    already counted in starting balance via the CC liability — and is NOT
-    re-projected on its effective_date."""
-    await _set_accounting_mode(session, "cash")
-
-    bank = await _make_manual_account(session, test_user.id, "CF CashMode Bank")
-    cc = await _make_cc_account(session, test_user.id, "CF CashMode CC")
-    # $1000 in bank
-    await _add_txn(
-        session, test_user.id, bank.id, 1000, "credit",
-        date.today(), source="opening_balance",
-    )
-    # CC purchase today, bill due in 20 days
+    """Cash only (Reports follow-up to RFC toledo-features): the balance is
+    the bank's money; a card purchase leaves it when the bill is paid, on the
+    card's next due day — whatever the global accounting mode."""
+    for mode in ("cash", "accrual"):
+        await _set_accounting_mode(session, mode)
+    bank = await _make_manual_account(session, test_user.id, "CF Cash Bank")
+    cc = await _make_cc_account(session, test_user.id, "CF Cash CC")
     today = date.today()
-    cc_purchase = Transaction(
+    cc.payment_due_day = (today + timedelta(days=20)).day
+    await _add_txn(session, test_user.id, bank.id, 1000, "credit", today, source="opening_balance")
+    session.add(Transaction(
         id=uuid.uuid4(), user_id=test_user.id, account_id=cc.id,
         description="CC Purchase", amount=Decimal("100"),
         date=today, effective_date=today + timedelta(days=20),
         type="debit", source="manual", currency="BRL",
         created_at=datetime.now(timezone.utc),
-    )
-    session.add(cc_purchase)
+    ))
     await session.commit()
 
     report = await get_cash_flow_report(session, test_workspace.id, test_user.id, months=2, interval="daily")
-
-    starting = next(b for b in report.summary.breakdowns if b.key == "startingBalance")
-    proj_exp = next(b for b in report.summary.breakdowns if b.key == "projectedExpenses")
-    ending = next(b for b in report.summary.breakdowns if b.key == "endingBalance")
-
-    # Cash mode: total balance = bank ($1000) - CC debt ($100) = $900
-    assert starting.value == 900.0
-    # No future flows queued — Transaction.date == today (not > today)
-    assert proj_exp.value == 0.0
-    assert ending.value == 900.0
+    totals = {b.key: b.value for b in report.summary.breakdowns}
+    assert totals["startingBalance"] == 1000.0  # the card's debt is not cash
+    assert totals["projectedExpenses"] == 100.0
+    assert totals["endingBalance"] == 900.0
+    due = report_service._next_due(today, cc.payment_due_day)
+    bill_point = next(p for p in report.trend if p.date == due.isoformat())
+    assert bill_point.breakdowns["outflow"] == 100.0
+    assert bill_point.value == 900.0
+    before = next(p for p in report.trend if p.date == (due - timedelta(days=1)).isoformat())
+    assert before.value == 1000.0
+    card_item = next(c for c in report.composition if c.key == f"card:{cc.id}")
+    assert card_item.value == 100.0
 
 
 @pytest.mark.asyncio
-async def test_cash_flow_accrual_mode_projects_cc_on_effective_date(
+async def test_cash_flow_card_without_due_day_is_paid_next_month(
     session: AsyncSession, test_user, test_workspace: User
 ):
-    """In accrual mode: a CC purchase with effective_date > today is added
-    back to starting balance (so it represents 'cash on hand right now') and
-    re-projected as an outflow on the bill due date."""
-    await _set_accounting_mode(session, "accrual")
-
-    bank = await _make_manual_account(session, test_user.id, "CF AccrualMode Bank")
-    cc = await _make_cc_account(session, test_user.id, "CF AccrualMode CC")
-    await _add_txn(
-        session, test_user.id, bank.id, 1000, "credit",
-        date.today(), source="opening_balance",
-    )
+    """A card with no due day still owes its debt: it leaves the bank on the
+    first of next month."""
+    bank = await _make_manual_account(session, test_user.id, "CF NoDue Bank")
+    cc = await _make_cc_account(session, test_user.id, "CF NoDue CC")
     today = date.today()
-    cc_purchase = Transaction(
-        id=uuid.uuid4(), user_id=test_user.id, account_id=cc.id,
-        description="CC Purchase", amount=Decimal("100"),
-        date=today, effective_date=today + timedelta(days=20),
-        type="debit", source="manual", currency="BRL",
-        created_at=datetime.now(timezone.utc),
-    )
-    session.add(cc_purchase)
-    await session.commit()
-
+    await _add_txn(session, test_user.id, bank.id, 1000, "credit", today, source="opening_balance")
+    await _add_txn(session, test_user.id, cc.id, 75, "debit", today)
     report = await get_cash_flow_report(session, test_workspace.id, test_user.id, months=2, interval="daily")
+    totals = {b.key: b.value for b in report.summary.breakdowns}
+    assert totals["startingBalance"] == 1000.0
+    assert totals["projectedExpenses"] == 75.0
+    first_next = _next_first_of_month(today).isoformat()
+    assert next(p for p in report.trend if p.date == first_next).breakdowns["outflow"] == 75.0
 
-    starting = next(b for b in report.summary.breakdowns if b.key == "startingBalance")
-    proj_exp = next(b for b in report.summary.breakdowns if b.key == "projectedExpenses")
-    ending = next(b for b in report.summary.breakdowns if b.key == "endingBalance")
-
-    # Accrual: pending CC ($100 debt) is added back → $900 + $100 = $1000.
-    assert starting.value == 1000.0
-    # Future outflow on day +20: $100.
-    assert proj_exp.value == 100.0
-    # Ending: $1000 - $100 = $900 (same wealth as cash mode, just timed differently).
-    assert ending.value == 900.0
-
-    # The dip happens on the bill due date.
-    bill_label = (today + timedelta(days=20)).isoformat()
-    bill_point = next(p for p in report.trend if p.date == bill_label)
-    assert bill_point.breakdowns["outflow"] == 100.0
-    assert bill_point.value == 900.0
-    # The day before the bill, balance is still 1000.
-    pre_bill_label = (today + timedelta(days=19)).isoformat()
-    pre_bill_point = next(p for p in report.trend if p.date == pre_bill_label)
-    assert pre_bill_point.value == 1000.0
 
 
 @pytest.mark.asyncio
@@ -1901,41 +1868,6 @@ async def test_cash_flow_accrual_mode_no_double_count(
     # ending matches cash mode's "what you'd have if you paid all CC bills"
     assert ending.value == 4800.0
 
-
-@pytest.mark.asyncio
-async def test_cash_flow_accrual_mode_cc_purchase_outside_window_ignored(
-    session: AsyncSession, test_user, test_workspace: User
-):
-    """A CC purchase whose effective_date falls past the projection window is
-    not added back nor projected — its impact remains in starting balance."""
-    await _set_accounting_mode(session, "accrual")
-
-    bank = await _make_manual_account(session, test_user.id, "CF Outside Bank")
-    cc = await _make_cc_account(session, test_user.id, "CF Outside CC")
-    await _add_txn(
-        session, test_user.id, bank.id, 1000, "credit",
-        date.today(), source="opening_balance",
-    )
-    today = date.today()
-    # Bill due 6 months out; we project only 2 months
-    session.add(Transaction(
-        id=uuid.uuid4(), user_id=test_user.id, account_id=cc.id,
-        description="CC Purchase Far", amount=Decimal("75"),
-        date=today, effective_date=today + timedelta(days=180),
-        type="debit", source="manual", currency="BRL",
-        created_at=datetime.now(timezone.utc),
-    ))
-    await session.commit()
-
-    report = await get_cash_flow_report(session, test_workspace.id, test_user.id, months=2, interval="daily")
-
-    starting = next(b for b in report.summary.breakdowns if b.key == "startingBalance")
-    proj_exp = next(b for b in report.summary.breakdowns if b.key == "projectedExpenses")
-
-    # CC debt is reflected in starting balance ($1000 - $75 = $925), no add-back
-    # because the bill is outside the projection window.
-    assert starting.value == 925.0
-    assert proj_exp.value == 0.0
 
 
 # ---------------------------------------------------------------------------

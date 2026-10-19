@@ -404,6 +404,18 @@ def _forecast_item(
     )
 
 
+async def _count_occurrences_before_any(
+    session: AsyncSession, recurring: RecurringTransaction, end: date, cache: dict
+) -> int:
+    """Still-virtual occurrences before ``end``: a computed recurrence's
+    expected/late slots (RFC toledo-features §8.5), else the legacy count."""
+    if recurring.auto_generate:
+        return _count_occurrences_before(recurring, end)
+    from app.services.recurrence_service import projected_occurrences
+
+    return len(await projected_occurrences(session, recurring, date(1900, 1, 1), end, cache=cache))
+
+
 def _count_occurrences_before(recurring: RecurringTransaction, end: date) -> int:
     """Count still-virtual effective occurrences before ``end`` without truncating."""
     nominal_start = recurring.next_occurrence
@@ -469,18 +481,29 @@ async def _project_recurring_items(
     items: list[tuple[TransactionCalendarItem, float]] = []
     deltas: dict[date, float] = {}
     carried_delta = 0.0
+    cache: dict = {}
     for rec in recurring_rows:
         if rec.account_id is None:
             continue
-        occurrences = get_occurrences_in_range(
-            start=rec.next_occurrence,
-            frequency=rec.frequency,
-            end_date=rec.end_date,
-            range_start=start,
-            range_end=end,
-            intended_day=rec.day_of_month or rec.start_date.day,
-            weekend_adjustment=rec.weekend_adjustment,
-        )
+        if rec.auto_generate:
+            occurrences = [
+                (d, rec.amount)
+                for d in get_occurrences_in_range(
+                    start=rec.next_occurrence,
+                    frequency=rec.frequency,
+                    end_date=rec.end_date,
+                    range_start=start,
+                    range_end=end,
+                    intended_day=rec.day_of_month or rec.start_date.day,
+                    weekend_adjustment=rec.weekend_adjustment,
+                )
+            ]
+        else:
+            # Computed forecast (RFC toledo-features §8.5): expected and late
+            # slots at the expected amount, never materialized.
+            from app.services.recurrence_service import projected_occurrences
+
+            occurrences = await projected_occurrences(session, rec, start, end, cache=cache)
         category = rec.category
         account = rec.account
         amount_primary = await _positive_primary_amount(
@@ -490,15 +513,23 @@ async def _project_recurring_items(
         is_transfer = bool(category and category.treat_as_transfer)
         is_ignored = bool(category and category.is_ignored)
         if not is_ignored:
-            carried_delta += _count_occurrences_before(rec, start) * signed_delta
-        for occ_date in occurrences:
+            carried_delta += await _count_occurrences_before_any(session, rec, start, cache) * signed_delta
+        for occ_date, occ_amount in occurrences:
+            occ_primary = (
+                amount_primary
+                if Decimal(str(occ_amount)) == Decimal(str(rec.amount))
+                else await _positive_primary_amount(
+                    session, Decimal(str(occ_amount)), rec.currency, primary_currency, None
+                )
+            )
+            occ_delta = occ_primary if rec.type == "credit" else -occ_primary
             item = TransactionCalendarItem(
                 kind="projected",
                 recurring_id=rec.id,
                 date=occ_date,
                 description=rec.description,
-                amount=float(rec.amount),
-                amount_primary=amount_primary,
+                amount=float(occ_amount),
+                amount_primary=occ_primary,
                 currency=rec.currency,
                 type=cast(Literal["debit", "credit"], rec.type),
                 account_id=rec.account_id,
@@ -511,11 +542,11 @@ async def _project_recurring_items(
                 is_transfer=is_transfer,
                 is_ignored=is_ignored,
             )
-            items.append((item, signed_delta))
+            items.append((item, occ_delta))
             # The row is still listed, but an ignored occurrence never moves the
             # projected balance: _daily_balance_deltas_by_date already leaves the
             # posted version out, so counting the projection here would promise a
             # balance that reverts the day the recurring actually posts.
             if not is_ignored:
-                deltas[occ_date] = deltas.get(occ_date, 0.0) + signed_delta
+                deltas[occ_date] = deltas.get(occ_date, 0.0) + occ_delta
     return items, deltas, carried_delta

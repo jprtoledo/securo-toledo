@@ -62,6 +62,10 @@ class AccountRead(AccountBase):
     available_credit: Optional[float] = None
     statement_close_day: Optional[int] = None
     payment_due_day: Optional[int] = None
+    # True when the user typed the cycle days; otherwise they are derived
+    # from the bills (RFC toledo-features §6.3).
+    cycle_days_manual: bool = False
+    available_credit_limit: Optional[float] = None
     next_close_date: Optional[date] = None
     next_due_date: Optional[date] = None
     minimum_payment: Optional[float] = None

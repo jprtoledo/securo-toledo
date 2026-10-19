@@ -364,27 +364,34 @@ export default function DashboardPage() {
   const cumulativeData = useMemo(() => {
     if (!balanceHistory) return []
     const daysInMonth = monthLastDay(selectedMonth)
-    const result: { day: number; current: number | null; previous: number }[] = []
-    let lastPrevBalance = 0
+    const result: { day: number; current: number | null; forecast: number | null; previous: number | null }[] = []
+    let lastPrevBalance: number | null = null
     for (let day = 1; day <= daysInMonth; day++) {
-      const cur = balanceHistory.current.find(d => d.day === day)
+      const cur = balanceHistory.current.find(d => d.day === day)?.balance ?? null
       const prev = balanceHistory.previous.find(d => d.day === day)
       if (prev?.balance != null) {
         lastPrevBalance = prev.balance
       }
       result.push({
         day,
-        current: cur?.balance ?? null,
-        previous: prev?.balance ?? lastPrevBalance,
+        current: cur,
+        // After today the dashed line is the forecast, not the month before.
+        forecast: balanceHistory.forecast?.find(d => d.day === day)?.balance ?? null,
+        previous: cur !== null ? lastPrevBalance : null,
       })
     }
     return result
   }, [balanceHistory, selectedMonth])
 
-  const lastCurrentPoint = [...cumulativeData].reverse().find(d => d.current !== null)
-  const lastDay = lastCurrentPoint?.day ?? 0
-  const currentStartBalance = balanceHistory?.current.find(d => d.day === 1)?.balance ?? 0
-  const currentLatestBalance = lastCurrentPoint?.current ?? 0
+  const lastCurrentPoint = [...cumulativeData].reverse().find(d => d.current !== null || d.forecast !== null)
+  const lastDay = [...cumulativeData].reverse().find(d => d.current !== null)?.day ?? 0
+  const hasActual = cumulativeData.some(d => d.current !== null)
+  const hasForecast = cumulativeData.some(d => d.forecast !== null)
+  const hasPreviousLine = cumulativeData.some(d => d.previous !== null)
+  // The period runs to the month's (forecast) close, from where the day
+  // before it ended.
+  const currentStartBalance = balanceHistory?.start_balance ?? balanceHistory?.current.find(d => d.day === 1)?.balance ?? 0
+  const currentLatestBalance = lastCurrentPoint ? (lastCurrentPoint.forecast ?? lastCurrentPoint.current ?? 0) : 0
   const monthVariation = currentLatestBalance - currentStartBalance
 
   const primaryCurrency = summary?.primary_currency ?? userCurrency
@@ -1008,14 +1015,24 @@ export default function DashboardPage() {
               )}
             </div>
             <div className="flex items-center gap-3 mt-2">
-              <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                <span className="inline-block w-3 h-0.5 rounded-full bg-emerald-500" />
-                {t('dashboard.balanceCurrentMonthLegend')}
-              </span>
-              <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                <span className="inline-block w-3 border-t-2 border-dashed border-slate-400" />
-                {t('dashboard.balancePreviousMonthLegend')}
-              </span>
+              {hasActual && (
+                <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <span className="inline-block w-3 h-0.5 rounded-full bg-emerald-500" />
+                  {t('dashboard.balanceCurrentMonthLegend')}
+                </span>
+              )}
+              {hasForecast && (
+                <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground" data-testid="balance-forecast-legend">
+                  <span className="inline-block w-3 border-t-2 border-dashed border-emerald-500" />
+                  {t('dashboard.balanceForecastLegend')}
+                </span>
+              )}
+              {hasPreviousLine && (
+                <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <span className="inline-block w-3 border-t-2 border-dashed border-slate-400" />
+                  {t('dashboard.balancePreviousMonthLegend')}
+                </span>
+              )}
             </div>
           </div>
           <div className="px-1 pb-4 flex-1 min-h-0">
@@ -1082,7 +1099,11 @@ export default function DashboardPage() {
                   <RechartsTooltip
                     formatter={(value, name) => [
                       value !== null ? (privacyMode ? MASK : formatCurrency(Number(value), userCurrency, locale)) : '\u2014',
-                      name === 'current' ? monthLabel(selectedMonth, uiLocale).split(' ')[0] : monthLabel(prevMonth, uiLocale).split(' ')[0],
+                      name === 'current'
+                        ? monthLabel(selectedMonth, uiLocale).split(' ')[0]
+                        : name === 'forecast'
+                          ? t('dashboard.balanceForecastLegend')
+                          : monthLabel(prevMonth, uiLocale).split(' ')[0],
                     ]}
                     labelFormatter={(day) => t('dashboard.day', { day })}
                     contentStyle={{
@@ -1106,12 +1127,24 @@ export default function DashboardPage() {
                   />
                   <Line
                     type="monotone"
+                    dataKey="forecast"
+                    stroke="#10B981"
+                    strokeWidth={2}
+                    strokeDasharray="5 3"
+                    dot={false}
+                    activeDot={{ r: 3, fill: '#10B981' }}
+                    connectNulls={false}
+                    isAnimationActive={false}
+                  />
+                  <Line
+                    type="monotone"
                     dataKey="previous"
                     stroke="#94A3B8"
                     strokeWidth={2}
                     strokeDasharray="5 3"
                     dot={false}
                     activeDot={{ r: 3, fill: '#94A3B8' }}
+                    connectNulls={false}
                   />
                 </ComposedChart>
               </ResponsiveContainer>
@@ -1121,8 +1154,9 @@ export default function DashboardPage() {
           </div>
           {!balanceHistoryLoading && lastCurrentPoint && (() => {
             const footerDay = hoveredDay ?? lastDay
-            const footerPrev = balanceHistory?.previous.find(d => d.day === footerDay)?.balance ?? 0
-            const footerCurrent = cumulativeData.find(d => d.day === footerDay)?.current ?? totalBalance
+            const footerPoint = cumulativeData.find(d => d.day === footerDay)
+            const footerPrev = footerPoint?.previous ?? 0
+            const footerCurrent = footerPoint?.current ?? totalBalance
             const footerPct = footerPrev !== 0 ? ((footerCurrent - footerPrev) / Math.abs(footerPrev)) * 100 : null
             if (footerPrev === 0 || footerPct === null) return null
             return (

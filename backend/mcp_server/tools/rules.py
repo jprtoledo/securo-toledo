@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.rules import _rule_match_definition_changed
-from app.schemas.rule import RuleCreate, RulePreviewRequest, RuleRead, RuleUpdate
+from app.schemas.rule import RuleCreate, RuleError, RulePreviewRequest, RuleRead, RuleUpdate
 from app.services import rule_service
 from mcp_server.auth import CallContext
 from mcp_server.registry import tool
@@ -18,10 +18,19 @@ from mcp_server.tools.proposals import _APPLY_FIELD, _PROPOSAL_PREFACE, _can_app
 
 
 _RULE_CAPABILITIES = (
-    " Conditions combine with AND/OR and filter description, payee, notes, "
-    "amount, type, account_id, payee_id, date, or status (pending/posted). "
-    "Actions can set category, payee, or description, append notes, or ignore "
-    "the transaction."
+    " Conditions combine with AND/OR, nest as groups ({op, conditions}) and "
+    "negations ({not: node}) up to 5 levels, and filter description, "
+    "description_key (letters only), original_description, "
+    "provider_description_raw, merchant_name, payee, notes, amount, "
+    "signed_amount, currency, type, status, operation_type, provider_category, "
+    "account_kind, account_id, payee_id or date; credit-card-scoped rules also "
+    "card_number, installment_number, total_installments, payment_type. "
+    "Operators include in/not_in (lists), not_regex, is_empty, is_not_empty. "
+    "scope_account_kind ('bank' or 'credit_card') or scope_account_id limits a "
+    "rule. Actions can set or clear the category, set payee or description, "
+    "append notes, ignore the transaction, and on credit cards set the card "
+    "line kind or strip an installment marker. A manual category is never "
+    "overridden unless overwrite_existing_categories is set."
 )
 
 
@@ -54,10 +63,12 @@ def _proposal_schema(
 async def list_rules(*, session: AsyncSession, ctx: CallContext) -> dict[str, Any]:
     workspace_id = await resolve_workspace_id(session, ctx)
     rules = await rule_service.get_rules(session, workspace_id)
-    items = [
-        RuleRead.model_validate(rule).model_dump(mode="json", exclude={"user_id"})
-        for rule in rules
-    ]
+    errors = await rule_service.rule_errors(session, workspace_id, rules)
+    items = []
+    for rule in rules:
+        item = RuleRead.model_validate(rule)
+        item.errors = [RuleError(**e) for e in errors.get(rule.id, [])]
+        items.append(item.model_dump(mode="json", exclude={"user_id"}))
     return {"items": items, "total": len(items)}
 
 
@@ -183,6 +194,11 @@ async def propose_create_rule(
         if draft.apply_to_existing
         else 0
     )
+    # Derived effects (category, card line kind) follow the rule everywhere
+    # it reaches, like the REST endpoint (RFC toledo-features AC-3.8).
+    applied_count += await rule_service.recompute_rule_scopes(
+        session, workspace_id, [(created.scope_account_kind, created.scope_account_id)]
+    )
     return {
         **proposal,
         "applied": True,
@@ -271,6 +287,7 @@ async def propose_update_rule(
     if not _can_apply(ctx, apply):
         return proposal
 
+    old_scope = (current.scope_account_kind, current.scope_account_id)
     updated = await rule_service.update_rule(
         session, uuid.UUID(rule_id), workspace_id, update
     )
@@ -285,6 +302,9 @@ async def propose_update_rule(
         )
         if should_apply
         else 0
+    )
+    applied_count += await rule_service.recompute_rule_scopes(
+        session, workspace_id, [old_scope, (updated.scope_account_kind, updated.scope_account_id)]
     )
     return {
         **proposal,
@@ -331,5 +351,7 @@ async def propose_delete_rule(
     if not _can_apply(ctx, apply):
         return proposal
 
+    old_scope = (rule.scope_account_kind, rule.scope_account_id)
     await rule_service.delete_rule(session, uuid.UUID(rule_id), workspace_id)
+    await rule_service.recompute_rule_scopes(session, workspace_id, [old_scope])
     return {**proposal, "applied": True, "id": rule_id}

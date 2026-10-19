@@ -217,6 +217,10 @@ def serialize_account(
         "credit_limit": float(acc.credit_limit) if acc.credit_limit is not None else None,
         "statement_close_day": acc.statement_close_day,
         "payment_due_day": acc.payment_due_day,
+        "cycle_days_manual": bool(acc.cycle_days_manual),
+        "available_credit_limit": (
+            float(acc.available_credit_limit) if acc.available_credit_limit is not None else None
+        ),
         "minimum_payment": float(acc.minimum_payment) if acc.minimum_payment is not None else None,
         "card_brand": acc.card_brand,
         "card_level": acc.card_level,
@@ -471,16 +475,16 @@ async def update_account(
 
 
 async def _recompute_effective_dates(session: AsyncSession, account: Account) -> None:
-    """Recompute effective_date on every transaction in this account.
+    """Re-place every transaction of this account after its cycle changed.
 
-    Called when an account's CC cycle metadata (statement_close_day,
-    payment_due_day) changes, so historical transactions get rebucketed into
-    the correct bill. Cheap: a few hundred rows per account at most."""
-    result = await session.execute(
-        select(Transaction).where(Transaction.account_id == account.id)
-    )
-    for tx in result.scalars():
-        apply_effective_date(tx, account)
+    Typing both cycle days is a manual override that derivation no longer
+    touches; clearing them hands the days back to the bills (RFC
+    toledo-features §6.3, AC-4.6). The account's recompute re-resolves every
+    effective date — bill links, forecasts and the cycle alike."""
+    from app.services.recompute_service import recompute_account
+
+    account.cycle_days_manual = bool(account.statement_close_day and account.payment_due_day)
+    await recompute_account(session, account.id)
 
 
 async def sync_opening_balance_for_connected_account(
@@ -644,6 +648,13 @@ async def delete_account(session: AsyncSession, account_id: uuid.UUID, workspace
             RecurringTransaction.account_id == account_id
         )
     )
+    # Recurrences it could also pay keep their other accounts.
+    shared = await session.execute(
+        select(RecurringTransaction).where(RecurringTransaction.extra_account_ids.is_not(None))
+    )
+    for recurring in shared.scalars():
+        if str(account_id) in (recurring.extra_account_ids or []):
+            recurring.extra_account_ids = [a for a in recurring.extra_account_ids if a != str(account_id)] or None
     await session.execute(
         update(Goal)
         .where(Goal.account_id == account_id)

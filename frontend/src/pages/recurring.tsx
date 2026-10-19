@@ -1,9 +1,12 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { getAccountName, sortAccountsByDisplayName } from '@/lib/account-utils'
 import { useTranslation } from 'react-i18next'
 import { useDisplayLocale, useDateLocale } from '@/hooks/use-display-locale'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { categories as categoriesApi, categoryGroups as categoryGroupsApi, recurring as recurringApi, accounts as accountsApi, currencies as currenciesApi } from '@/lib/api'
+import { categories as categoriesApi, categoryGroups as categoryGroupsApi, recurring as recurringApi, accounts as accountsApi, currencies as currenciesApi, transactions as transactionsApi } from '@/lib/api'
+import { billedUnits } from '@/lib/recurrence-utils'
+import { ConditionTreeEditor } from '@/components/rule-dialog'
 import { extractApiError } from '@/lib/api-errors'
 import { localDateString } from '@/lib/date-utils'
 import { invalidateFinancialQueries } from '@/lib/invalidate-queries'
@@ -19,8 +22,9 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
-import type { Category, CategoryGroup, RecurringTransaction } from '@/types'
-import { Pencil, Trash2, Plus, RefreshCw, Info } from 'lucide-react'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import type { Account, Category, CategoryGroup, RecurrenceSlot, RecurringSuggestion, RecurringTransaction, RuleConditionNode } from '@/types'
+import { Pencil, Trash2, Plus, RefreshCw, Info, AlertTriangle, X, Sparkles } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { PageHeader } from '@/components/page-header'
 import { CategorySelect } from '@/components/category-select'
@@ -49,6 +53,102 @@ function SectionHeader({ title, action }: { title: string; action?: React.ReactN
   )
 }
 
+const SLOT_CLASS: Record<RecurrenceSlot['status'], string> = {
+  posted: 'bg-emerald-500 border-emerald-500',
+  conflict: 'bg-rose-500 border-rose-500',
+  expected: 'bg-transparent border-muted-foreground/50',
+  late: 'bg-amber-400 border-amber-400',
+  missed: 'bg-transparent border-rose-500',
+  skipped: 'bg-muted-foreground/25 border-muted-foreground/25',
+}
+
+// Occurrences without a charge can be marked as not happening (or undone):
+// reports count every occurrence still to come except skipped ones.
+const SKIPPABLE = new Set<RecurrenceSlot['status']>(['expected', 'late', 'missed', 'skipped'])
+
+/** The periods around today (RFC toledo-features §8.4): a few settled ones,
+ * then the next ones to come. */
+function visibleSlots(slots: RecurrenceSlot[]): RecurrenceSlot[] {
+  const today = localDateString()
+  const next = slots.findIndex((s) => s.status === 'expected' || s.status === 'late' || (s.status === 'skipped' && s.expected_date >= today))
+  return next < 0 ? slots.slice(-8) : slots.slice(Math.max(0, next - 4), next + 6)
+}
+
+export function RecurrenceTimeline({ slots, currency, onSkip, accountId, accountNames }: {
+  slots: RecurrenceSlot[]
+  currency: string
+  onSkip?: (period: string, skipped: boolean) => void
+  // The recurrence's own account and every account's name: a slot paid by
+  // another account names it.
+  accountId?: string | null
+  accountNames?: Record<string, string>
+}) {
+  const { t, i18n } = useTranslation()
+  const locale = useDisplayLocale()
+  const { mask } = usePrivacyMode()
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-0.5" data-testid="recurrence-timeline">
+      {visibleSlots(slots).map((slot) => {
+        const label = new Date(slot.expected_date + 'T00:00:00').toLocaleDateString(i18n.language, { month: 'short', year: '2-digit' })
+        const amount = slot.amount ?? slot.expected_amount
+        const paidElsewhere = slot.account_id && slot.account_id !== accountId ? accountNames?.[slot.account_id] : undefined
+        const title = [
+          label,
+          t(`recurring.slot.${slot.status}`),
+          mask(formatCurrency(Number(amount), currency, locale)),
+          ...(paidElsewhere ? [t('recurring.paidFrom', { account: paidElsewhere })] : []),
+        ].join(' · ')
+        const dot = (
+          <span className={cn('inline-block h-2.5 w-2.5 rounded-full border-2', SLOT_CLASS[slot.status], slot.excluded && 'opacity-50')} />
+        )
+        if (!onSkip || !SKIPPABLE.has(slot.status)) {
+          return (
+            <span key={slot.period} title={title} aria-label={title} data-status={slot.status} className="inline-flex p-1">
+              {dot}
+            </span>
+          )
+        }
+        const skipped = slot.status === 'skipped'
+        return (
+          <Popover key={slot.period}>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                title={title}
+                aria-label={title}
+                data-status={slot.status}
+                className="inline-flex rounded-full p-1 hover:bg-muted-foreground/15 focus-visible:outline-2 focus-visible:outline-ring"
+              >
+                {dot}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-64 p-3">
+              <p className="text-xs font-medium text-foreground">{label} · {mask(formatCurrency(Number(amount), currency, locale))}</p>
+              <p className="mt-0.5 text-xs text-muted-foreground">{t(`recurring.slot.${slot.status}`)}</p>
+              <p className="mt-2 text-xs text-muted-foreground">{t(skipped ? 'recurring.skip.undoHint' : 'recurring.skip.hint')}</p>
+              <Button
+                size="sm"
+                variant="outline"
+                className="mt-3 w-full"
+                onClick={() => onSkip(slot.period, !skipped)}
+              >
+                {t(skipped ? 'recurring.skip.undo' : 'recurring.skip.action')}
+              </Button>
+            </PopoverContent>
+          </Popover>
+        )
+      })}
+    </div>
+  )
+}
+
+/** Empty condition tree ↔ no condition (the legacy matcher). */
+function toConditionTree(node: RuleConditionNode | null | undefined): { op: 'and' | 'or'; conditions: RuleConditionNode[] } {
+  if (!node) return { op: 'and', conditions: [] }
+  if ('conditions' in node && Array.isArray(node.conditions)) return { op: node.op, conditions: node.conditions }
+  return { op: 'and', conditions: [node] }
+}
+
 export default function RecurringPage() {
   const { t } = useTranslation()
 
@@ -72,6 +172,33 @@ function RecurringTab() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editing, setEditing] = useState<RecurringTransaction | null>(null)
   const [deletingRecurring, setDeletingRecurring] = useState<RecurringTransaction | null>(null)
+  const [draft, setDraft] = useState<Partial<RecurringTransaction> | null>(null)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const fromTransaction = searchParams.get('fromTransaction')
+
+  // "Make recurring" from a transaction (RFC §8.6): open the form prefilled.
+  useEffect(() => {
+    if (!fromTransaction) return
+    let cancelled = false
+    transactionsApi.recurringDraft(fromTransaction)
+      .then((data) => {
+        if (cancelled) return
+        setEditing(null)
+        setDraft(data)
+        setDialogOpen(true)
+      })
+      .catch((err: unknown) => toast.error(extractApiError(err, t('common.error'))))
+      .finally(() => {
+        if (!cancelled) setSearchParams((prev) => { prev.delete('fromTransaction'); return prev }, { replace: true })
+      })
+    return () => { cancelled = true }
+  }, [fromTransaction, setSearchParams, t])
+
+  const closeDialog = () => { setDialogOpen(false); setEditing(null); setDraft(null) }
+  const savedToast = (message: string, data: RecurringTransaction) => {
+    const linked = data.link_stats?.linked
+    toast.success(linked ? `${message} · ${t('recurring.linkedCount', { count: linked })}` : message)
+  }
 
   const { data: recurringList } = useQuery({
     queryKey: ['recurring'],
@@ -98,29 +225,33 @@ function RecurringTab() {
     queryKey: ['accounts'],
     queryFn: () => accountsApi.list(),
   })
+  const accountNames = useMemo(
+    () => Object.fromEntries((accountsList ?? []).map((a) => [a.id, getAccountName(a)])) as Record<string, string>,
+    [accountsList],
+  )
 
   const createMutation = useMutation({
     mutationFn: (data: Partial<RecurringTransaction>) => recurringApi.create(data),
-    onSuccess: () => {
+    onSuccess: (data) => {
       invalidateFinancialQueries(queryClient)
       queryClient.invalidateQueries({ queryKey: ['recurring'] })
-      setDialogOpen(false)
-      toast.success(t('recurring.created'))
+      queryClient.invalidateQueries({ queryKey: ['recurring-suggestions'] })
+      closeDialog()
+      savedToast(t('recurring.created'), data)
     },
-    onError: () => toast.error(t('common.error')),
+    onError: (err: unknown) => toast.error(extractApiError(err, t('common.error'))),
   })
 
   const updateMutation = useMutation({
     mutationFn: ({ id, ...data }: Partial<RecurringTransaction> & { id: string }) =>
       recurringApi.update(id, data),
-    onSuccess: () => {
+    onSuccess: (data) => {
       invalidateFinancialQueries(queryClient)
       queryClient.invalidateQueries({ queryKey: ['recurring'] })
-      setDialogOpen(false)
-      setEditing(null)
-      toast.success(t('recurring.updated'))
+      closeDialog()
+      savedToast(t('recurring.updated'), data)
     },
-    onError: () => toast.error(t('common.error')),
+    onError: (err: unknown) => toast.error(extractApiError(err, t('common.error'))),
   })
 
   const deleteMutation = useMutation({
@@ -134,6 +265,27 @@ function RecurringTab() {
     onError: (err: unknown) => {
       toast.error(extractApiError(err, t('common.error')))
     },
+  })
+
+  const endMutation = useMutation({
+    mutationFn: (id: string) => recurringApi.end(id),
+    onSuccess: () => {
+      invalidateFinancialQueries(queryClient)
+      queryClient.invalidateQueries({ queryKey: ['recurring'] })
+      toast.success(t('recurring.ended'))
+    },
+    onError: (err: unknown) => toast.error(extractApiError(err, t('common.error'))),
+  })
+
+  const skipMutation = useMutation({
+    mutationFn: ({ id, period, skipped }: { id: string; period: string; skipped: boolean }) =>
+      recurringApi.skip(id, period, skipped),
+    onSuccess: (_data, { skipped }) => {
+      invalidateFinancialQueries(queryClient)
+      queryClient.invalidateQueries({ queryKey: ['recurring'] })
+      toast.success(t(skipped ? 'recurring.skip.done' : 'recurring.skip.undone'))
+    },
+    onError: (err: unknown) => toast.error(extractApiError(err, t('common.error'))),
   })
 
   const generateMutation = useMutation({
@@ -154,6 +306,7 @@ function RecurringTab() {
       weekly: t('recurring.weekly'),
       biweekly: t('recurring.biweekly'),
       yearly: t('recurring.yearly'),
+      weekly_billed_monthly: t('recurring.weekly_billed_monthly'),
     }
     return map[f] ?? f
   }
@@ -166,7 +319,7 @@ function RecurringTab() {
           action={
             canWrite ? (
               <div className="flex gap-2">
-                <Button
+                {recurringList?.some((rt) => rt.auto_generate) && <Button
                   variant="outline"
                   size="sm"
                   className="gap-1.5 h-8"
@@ -175,8 +328,8 @@ function RecurringTab() {
                 >
                   <RefreshCw size={12} />
                   <span className="hidden sm:inline">{t('recurring.generatePending')}</span>
-                </Button>
-                <Button size="sm" className="gap-1.5 h-8" onClick={() => { setEditing(null); setDialogOpen(true) }}>
+                </Button>}
+                <Button size="sm" className="gap-1.5 h-8" onClick={() => { setEditing(null); setDraft(null); setDialogOpen(true) }}>
                   <Plus size={13} /> <span className="hidden sm:inline">{t('recurring.add')}</span>
                 </Button>
               </div>
@@ -198,7 +351,50 @@ function RecurringTab() {
             <tbody>
               {recurringList.map((rt) => (
                 <tr key={rt.id} className="border-b border-border last:border-0 hover:bg-muted transition-colors">
-                  <td className="py-3 pl-4 sm:pl-5 text-sm font-medium text-foreground">{rt.description}</td>
+                  <td className="py-3 pl-4 sm:pl-5 text-sm font-medium text-foreground">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span>{rt.description}</span>
+                      {(rt.extra_account_ids?.length ?? 0) > 0 && (
+                        <span
+                          className="text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground"
+                          title={[rt.account_id, ...(rt.extra_account_ids ?? [])].map((id) => accountNames[id ?? ''] ?? '').filter(Boolean).join(', ')}
+                          data-testid="recurring-accounts"
+                        >
+                          {t('recurring.accountsCount', { count: 1 + (rt.extra_account_ids?.length ?? 0) })}
+                        </span>
+                      )}
+                      {(rt.alerts?.conflicts ?? 0) > 0 && (
+                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-rose-500/10 text-rose-600" data-testid="recurring-conflicts">
+                          {t('recurring.conflicts', { count: rt.alerts!.conflicts })}
+                        </span>
+                      )}
+                    </div>
+                    {rt.timeline && rt.timeline.length > 0 && (
+                      <RecurrenceTimeline
+                        slots={rt.timeline}
+                        currency={rt.currency}
+                        accountId={rt.account_id}
+                        accountNames={accountNames}
+                        onSkip={canWrite && !rt.auto_generate ? (period, skipped) => skipMutation.mutate({ id: rt.id, period, skipped }) : undefined}
+                      />
+                    )}
+                    {rt.alerts?.suggest_end && rt.is_active && (
+                      <div className="mt-1.5 flex flex-wrap items-center gap-2 rounded-md bg-amber-500/10 px-2 py-1 text-xs font-normal text-amber-700 dark:text-amber-400" data-testid="recurring-suggest-end">
+                        <AlertTriangle size={12} className="shrink-0" />
+                        <span>{t('recurring.suggestEnd', { count: rt.alerts.missed_streak })}</span>
+                        {canWrite && (
+                          <button
+                            type="button"
+                            className="font-semibold underline-offset-2 hover:underline"
+                            onClick={() => endMutation.mutate(rt.id)}
+                            disabled={endMutation.isPending}
+                          >
+                            {t('recurring.end')}
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </td>
                   <td className={`py-3 text-xs sm:text-sm font-bold tabular-nums ${rt.type === 'credit' ? 'text-emerald-600' : 'text-rose-500'}`}>
                     {mask(`${rt.type === 'credit' ? '+' : '−'}${formatCurrency(rt.amount, rt.currency, locale)}`)}
                     {rt.currency !== userCurrency && rt.amount_primary != null && (
@@ -216,7 +412,7 @@ function RecurringTab() {
                     </span>
                   </td>
                   <td className="py-3 text-xs text-muted-foreground tabular-nums hidden md:table-cell">
-                    {new Date(rt.next_occurrence + 'T00:00:00').toLocaleDateString(dateLocale)}
+                    {new Date((rt.next?.expected_date ?? rt.next_occurrence) + 'T00:00:00').toLocaleDateString(dateLocale)}
                   </td>
                   <td className="py-3 hidden sm:table-cell">
                     <span className={cn(
@@ -260,14 +456,39 @@ function RecurringTab() {
         )}
       </SectionCard>
 
-      <Dialog open={dialogOpen} onOpenChange={() => { setDialogOpen(false); setEditing(null) }}>
-        <DialogContent>
+      {canWrite && (
+        <RecurringSuggestions
+          accounts={accountsList ?? []}
+          onCreate={(suggestion) => {
+            setEditing(null)
+            setDraft({
+              description: suggestion.description,
+              amount: Number(suggestion.amount),
+              currency: suggestion.currency,
+              type: suggestion.type,
+              frequency: suggestion.frequency,
+              day_of_month: suggestion.day_of_month,
+              day_window: suggestion.day_window,
+              start_date: suggestion.start_date,
+              account_id: suggestion.account_id,
+              amount_mode: suggestion.amount_mode,
+              amount_tolerance_pct: suggestion.amount_tolerance_pct,
+              match_condition: suggestion.match_condition,
+            })
+            setDialogOpen(true)
+          }}
+        />
+      )}
+
+      <Dialog open={dialogOpen} onOpenChange={closeDialog}>
+        <DialogContent className="sm:max-w-2xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{editing ? t('recurring.edit') : t('recurring.add')}</DialogTitle>
           </DialogHeader>
           <RecurringForm
-            key={editing?.id ?? 'new'}
+            key={editing?.id ?? (draft ? JSON.stringify(draft) : 'new')}
             recurring={editing}
+            draft={draft}
             categories={categoriesList ?? []}
             categoryGroups={categoryGroupsList ?? []}
             currentCategory={allCategoriesList?.find(
@@ -281,7 +502,7 @@ function RecurringTab() {
                 createMutation.mutate(data)
               }
             }}
-            onCancel={() => { setDialogOpen(false); setEditing(null) }}
+            onCancel={closeDialog}
             loading={createMutation.isPending || updateMutation.isPending}
           />
         </DialogContent>
@@ -299,8 +520,103 @@ function RecurringTab() {
   )
 }
 
+/** Recurring charges detected in an account's history (RFC §8.5). */
+function RecurringSuggestions({
+  accounts,
+  onCreate,
+}: {
+  accounts: Account[]
+  onCreate: (suggestion: RecurringSuggestion) => void
+}) {
+  const { t, i18n } = useTranslation()
+  const locale = useDisplayLocale()
+  const { mask } = usePrivacyMode()
+  const queryClient = useQueryClient()
+  const candidates = useMemo(
+    () => sortAccountsByDisplayName(accounts.filter((a) => !a.is_closed && a.type !== 'investment')),
+    [accounts],
+  )
+  const [accountId, setAccountId] = useState('')
+  const selected = accountId || candidates[0]?.id || ''
+
+  const { data: suggestions } = useQuery({
+    queryKey: ['recurring-suggestions', selected],
+    queryFn: () => recurringApi.suggestions(selected),
+    enabled: !!selected,
+  })
+
+  const dismissMutation = useMutation({
+    mutationFn: (key: string) => recurringApi.dismissSuggestion(selected, key),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['recurring-suggestions', selected] }),
+    onError: () => toast.error(t('common.error')),
+  })
+
+  if (candidates.length === 0) return null
+  const frequencyLabel = (f: string) => t(`recurring.${f}`)
+
+  return (
+    <div className="mt-4">
+      <SectionCard>
+        <SectionHeader
+          title={t('recurring.suggestions.title')}
+          action={
+            <select
+              className="border border-border rounded-lg px-2 py-1 text-xs bg-card text-foreground"
+              value={selected}
+              onChange={(e) => setAccountId(e.target.value)}
+              aria-label={t('recurring.account')}
+            >
+              {candidates.map((acc) => <option key={acc.id} value={acc.id}>{getAccountName(acc)}</option>)}
+            </select>
+          }
+        />
+        {suggestions && suggestions.length > 0 ? (
+          <ul className="divide-y divide-border" data-testid="recurring-suggestions">
+            {suggestions.map((s) => (
+              <li key={s.key} className="flex flex-wrap items-center gap-3 px-4 sm:px-5 py-3">
+                <Sparkles size={14} className="shrink-0 text-primary" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-foreground truncate">{s.description}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {frequencyLabel(s.frequency)}
+                    {' · '}
+                    {s.amount_mode === 'variable' ? t('recurring.suggestions.about') + ' ' : ''}
+                    {mask(formatCurrency(Number(s.amount), s.currency, locale))}
+                    {' · '}
+                    {t('recurring.suggestions.seen', {
+                      count: s.periods_covered,
+                      last: s.occurrences.length
+                        ? new Date(s.occurrences[s.occurrences.length - 1].date + 'T00:00:00').toLocaleDateString(i18n.language, { day: '2-digit', month: 'short' })
+                        : '',
+                    })}
+                  </p>
+                </div>
+                <div className="flex gap-2">
+                  <Button size="sm" className="h-7 text-xs" onClick={() => onCreate(s)}>{t('recurring.suggestions.create')}</Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 text-xs gap-1"
+                    onClick={() => dismissMutation.mutate(s.key)}
+                    disabled={dismissMutation.isPending}
+                  >
+                    <X size={12} /> {t('recurring.suggestions.dismiss')}
+                  </Button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-sm text-muted-foreground text-center py-6">{t('recurring.suggestions.empty')}</p>
+        )}
+      </SectionCard>
+    </div>
+  )
+}
+
 function RecurringForm({
   recurring,
+  draft,
   categories,
   categoryGroups,
   currentCategory,
@@ -310,38 +626,77 @@ function RecurringForm({
   loading,
 }: {
   recurring: RecurringTransaction | null
+  draft?: Partial<RecurringTransaction> | null
   categories: Category[]
   categoryGroups: CategoryGroup[]
   currentCategory?: Category
-  accounts: { id: string; name: string; display_name?: string | null }[]
+  accounts: { id: string; name: string; display_name?: string | null; type?: string; is_closed?: boolean }[]
   onSave: (data: Partial<RecurringTransaction>) => void
   onCancel: () => void
   loading: boolean
 }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = useDisplayLocale()
   const { user } = useAuth()
   const userCurrency = user?.preferences?.currency_display ?? 'USD'
+  const src: Partial<RecurringTransaction> | null = recurring ?? draft ?? null
   const sortedAccounts = useMemo(() => sortAccountsByDisplayName(accounts), [accounts])
   const { data: supportedCurrencies } = useQuery({
     queryKey: ['currencies'],
     queryFn: currenciesApi.list,
     staleTime: Infinity,
   })
-  const [description, setDescription] = useState(recurring?.description ?? '')
-  const [amount, setAmount] = useState(recurring?.amount?.toString() ?? '')
-  const [currency, setCurrency] = useState(recurring?.currency ?? userCurrency)
-  const [type, setType] = useState<'debit' | 'credit'>(recurring?.type ?? 'debit')
-  const [frequency, setFrequency] = useState(recurring?.frequency ?? 'monthly')
+  const [description, setDescription] = useState(src?.description ?? '')
+  const [amount, setAmount] = useState(src?.amount?.toString() ?? '')
+  const [currency, setCurrency] = useState(src?.currency ?? userCurrency)
+  const [type, setType] = useState<'debit' | 'credit'>(src?.type ?? 'debit')
+  const [frequency, setFrequency] = useState(src?.frequency ?? 'monthly')
   const [weekendAdjustment, setWeekendAdjustment] = useState<RecurringTransaction['weekend_adjustment']>(
-    recurring?.weekend_adjustment ?? 'none'
+    src?.weekend_adjustment ?? 'none'
   )
-  const [dayOfMonth, setDayOfMonth] = useState(recurring?.day_of_month?.toString() ?? '')
-  const [startDate, setStartDate] = useState(recurring?.start_date ?? localDateString())
-  const [endDate, setEndDate] = useState(recurring?.end_date ?? '')
-  const [categoryId, setCategoryId] = useState(recurring?.category_id ?? '')
-  const [accountId, setAccountId] = useState(recurring?.account_id ?? sortedAccounts[0]?.id ?? '')
+  const [dayOfMonth, setDayOfMonth] = useState(src?.day_of_month?.toString() ?? '')
+  const [startDate, setStartDate] = useState(src?.start_date ?? localDateString())
+  const [endDate, setEndDate] = useState(src?.end_date ?? '')
+  const [categoryId, setCategoryId] = useState(src?.category_id ?? '')
+  const [accountId, setAccountId] = useState(src?.account_id ?? sortedAccounts[0]?.id ?? '')
+  const [extraAccountIds, setExtraAccountIds] = useState<string[]>(src?.extra_account_ids ?? [])
+  const extraCandidates = sortedAccounts.filter((a) => a.id !== accountId && !a.is_closed)
   const [isActive, setIsActive] = useState(recurring?.is_active ?? true)
-  const [autoGenerate, setAutoGenerate] = useState(recurring?.auto_generate ?? true)
+  // New recurrences are forecast from their timeline (RFC §8.8); the
+  // placeholder generator stays only for recurrences that already use it.
+  const [autoGenerate, setAutoGenerate] = useState(recurring?.auto_generate ?? false)
+  const showAutoGenerate = !!recurring?.auto_generate
+  const [amountMode, setAmountMode] = useState<'fixed' | 'variable'>(src?.amount_mode ?? 'fixed')
+  const [tolerance, setTolerance] = useState(String(src?.amount_tolerance_pct ?? '0'))
+  const [dayWindow, setDayWindow] = useState(src?.day_window?.toString() ?? '')
+  const [billingWeekday, setBillingWeekday] = useState(String(src?.billing_weekday ?? 0))
+  const [weekBasis, setWeekBasis] = useState<'previous_month' | 'same_month'>(src?.week_count_basis ?? 'previous_month')
+  const [conditionTree, setConditionTree] = useState(() => toConditionTree(src?.match_condition))
+  const isWeeklyBilled = frequency === 'weekly_billed_monthly'
+  const selectedAccount = sortedAccounts.find((a) => a.id === accountId)
+  const conditionScope = selectedAccount?.type === 'credit_card' ? 'credit_card' : selectedAccount ? 'bank' : null
+
+  const weekdayNames = useMemo(
+    () => Array.from({ length: 7 }, (_, i) =>
+      // 2024-01-01 was a Monday: weekday 0 in the backend's convention.
+      new Date(Date.UTC(2024, 0, 1 + i)).toLocaleDateString(i18n.language, { weekday: 'long', timeZone: 'UTC' })),
+    [i18n.language],
+  )
+  // Live preview of the next bill (AC-6.8): "October: 5 × R$150 = R$750".
+  const weeklyPreview = useMemo(() => {
+    if (!isWeeklyBilled) return null
+    const perWeek = parseFloat(amount)
+    if (!Number.isFinite(perWeek)) return null
+    const today = new Date()
+    const { units, year, month } = billedUnits(today.getFullYear(), today.getMonth() + 1, Number(billingWeekday), weekBasis)
+    const monthName = new Date(year, month - 1, 1).toLocaleDateString(i18n.language, { month: 'long' })
+    return t('recurring.weeklyPreview', {
+      month: monthName,
+      units,
+      amount: formatCurrency(perWeek, currency, locale),
+      total: formatCurrency(perWeek * units, currency, locale),
+    })
+  }, [isWeeklyBilled, amount, billingWeekday, weekBasis, currency, locale, i18n.language, t])
 
   const selectClass = 'w-full border border-border rounded-lg px-3 py-2 text-sm bg-card text-foreground focus:outline-none focus:ring-2 focus:ring-primary'
 
@@ -361,8 +716,17 @@ function RecurringForm({
           end_date: endDate || null,
           category_id: categoryId || null,
           account_id: accountId || null,
+          extra_account_ids: autoGenerate ? [] : extraAccountIds.filter((id) => id !== accountId),
           is_active: isActive,
           auto_generate: autoGenerate,
+          amount_mode: amountMode,
+          amount_tolerance_pct: tolerance === '' ? 0 : parseFloat(tolerance),
+          day_window: dayWindow === '' ? null : parseInt(dayWindow),
+          billing_weekday: isWeeklyBilled ? Number(billingWeekday) : null,
+          week_count_basis: isWeeklyBilled ? weekBasis : null,
+          match_condition: conditionTree.conditions.length
+            ? { op: conditionTree.op, conditions: conditionTree.conditions }
+            : null,
         } as Partial<RecurringTransaction>)
       }}
       className="space-y-4"
@@ -373,7 +737,7 @@ function RecurringForm({
       </div>
       <div className="grid grid-cols-3 gap-4">
         <div className="space-y-2">
-          <Label>{t('recurring.amount')}</Label>
+          <Label>{isWeeklyBilled ? t('recurring.amountPerWeek') : t('recurring.amount')}</Label>
           <Input type="number" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} required />
         </div>
         <div className="space-y-2">
@@ -402,14 +766,57 @@ function RecurringForm({
             <option value="weekly">{t('recurring.weekly')}</option>
             <option value="biweekly">{t('recurring.biweekly')}</option>
             <option value="yearly">{t('recurring.yearly')}</option>
+            <option value="weekly_billed_monthly">{t('recurring.weekly_billed_monthly')}</option>
           </select>
         </div>
-        {(frequency === 'monthly' || frequency === 'quarterly' || frequency === 'semiannual') && (
+        {(frequency === 'monthly' || frequency === 'quarterly' || frequency === 'semiannual' || isWeeklyBilled) && (
           <div className="space-y-2">
-            <Label>{t('recurring.dayOfMonth')}</Label>
-            <Input type="number" min="1" max="31" value={dayOfMonth} onChange={(e) => setDayOfMonth(e.target.value)} />
+            <Label>{isWeeklyBilled ? t('recurring.billingDay') : t('recurring.dayOfMonth')}</Label>
+            <Input type="number" min="1" max="31" value={dayOfMonth} onChange={(e) => setDayOfMonth(e.target.value)} required={isWeeklyBilled} />
           </div>
         )}
+      </div>
+      {isWeeklyBilled && (
+        <div className="space-y-2 rounded-lg border border-border p-3">
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label>{t('recurring.billingWeekday')}</Label>
+              <select className={selectClass} value={billingWeekday} onChange={(e) => setBillingWeekday(e.target.value)}>
+                {weekdayNames.map((name, i) => <option key={i} value={i}>{name}</option>)}
+              </select>
+            </div>
+            <div className="space-y-2">
+              <Label>{t('recurring.weekCountBasis')}</Label>
+              <select className={selectClass} value={weekBasis} onChange={(e) => setWeekBasis(e.target.value as 'previous_month' | 'same_month')}>
+                <option value="previous_month">{t('recurring.basisPreviousMonth')}</option>
+                <option value="same_month">{t('recurring.basisSameMonth')}</option>
+              </select>
+            </div>
+          </div>
+          {weeklyPreview && <p className="text-xs text-muted-foreground" data-testid="weekly-preview">{weeklyPreview}</p>}
+        </div>
+      )}
+      <div className="grid grid-cols-3 gap-4">
+        <div className="space-y-2">
+          <Label>{t('recurring.amountMode')}</Label>
+          <select className={selectClass} value={amountMode} onChange={(e) => setAmountMode(e.target.value as 'fixed' | 'variable')}>
+            <option value="fixed">{t('recurring.amountFixed')}</option>
+            <option value="variable">{t('recurring.amountVariable')}</option>
+          </select>
+        </div>
+        <div className="space-y-2">
+          <Label>{t('recurring.tolerance')}</Label>
+          <Input type="number" min="0" max="100" step="0.1" value={tolerance} onChange={(e) => setTolerance(e.target.value)} />
+        </div>
+        <div className="space-y-2">
+          <Label>{t('recurring.dayWindow')}</Label>
+          <Input type="number" min="0" max="31" value={dayWindow} onChange={(e) => setDayWindow(e.target.value)} placeholder={t('recurring.dayWindowAuto')} />
+        </div>
+      </div>
+      <div className="space-y-2">
+        <Label>{t('recurring.matchCondition')}</Label>
+        <p className="text-xs text-muted-foreground">{t('recurring.matchConditionHint')}</p>
+        <ConditionTreeEditor value={conditionTree} onChange={setConditionTree} scope={conditionScope} accounts={sortedAccounts} />
       </div>
       <div className="space-y-2">
         <Label>{t('recurring.weekendAdjustment')}</Label>
@@ -461,7 +868,26 @@ function RecurringForm({
           </select>
         </div>
       </div>
-      <label className="flex items-start gap-2 cursor-pointer">
+      {!autoGenerate && extraCandidates.length > 0 && (
+        <div className="space-y-2" data-testid="extra-accounts">
+          <Label>{t('recurring.extraAccounts')}</Label>
+          <p className="text-xs text-muted-foreground">{t('recurring.extraAccountsHint')}</p>
+          <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+            {extraCandidates.map((acc) => (
+              <label key={acc.id} className="flex items-center gap-2 cursor-pointer text-sm text-foreground">
+                <input
+                  type="checkbox"
+                  checked={extraAccountIds.includes(acc.id)}
+                  onChange={(e) => setExtraAccountIds((ids) => e.target.checked ? [...ids, acc.id] : ids.filter((id) => id !== acc.id))}
+                  className="h-4 w-4 rounded border-border"
+                />
+                {getAccountName(acc)}
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+      {showAutoGenerate && <label className="flex items-start gap-2 cursor-pointer">
         <input
           type="checkbox"
           checked={autoGenerate}
@@ -472,7 +898,7 @@ function RecurringForm({
           {t('recurring.autoGenerate')}
           <span className="block text-xs text-muted-foreground">{t('recurring.autoGenerateHelp')}</span>
         </span>
-      </label>
+      </label>}
       {recurring && (
         <label className="flex items-center gap-2 cursor-pointer">
           <input

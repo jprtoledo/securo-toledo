@@ -40,6 +40,8 @@ import { PayeeSelect } from '@/components/payee-select'
 import { RuleDialog, type RuleDialogInitialData } from '@/components/rule-dialog'
 import { TransactionAttachments } from '@/components/transaction-attachments'
 import type { AttachmentPreview } from '@/components/transaction-attachments'
+import { TransactionSyncPanel } from '@/components/transaction-sync-panel'
+import { TransactionRecurrencePanel } from '@/components/transaction-recurrence-panel'
 import { TransactionSplitsSection } from '@/components/transaction-splits-section'
 import { buildInstallmentSeriesInput, hasNonStatusChange, isManualInstallmentSeriesRow } from '@/lib/installment-series'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
@@ -481,7 +483,7 @@ function TransactionForm({
   // the transaction's own amount and status.
   const [isInstallment, setIsInstallment] = useState(false)
   const [installmentCount, setInstallmentCount] = useState('2')
-  const [installmentFrequency, setInstallmentFrequency] = useState<RecurringTransaction['frequency']>('monthly')
+  const [installmentFrequency, setInstallmentFrequency] = useState<Exclude<RecurringTransaction['frequency'], 'weekly_billed_monthly'>>('monthly')
   // Optional split-with-group payload. `null` = leave splits as-is on
   // update, or no splits on create. The dedicated section component
   // owns its own UI state and surfaces a normalized payload here.
@@ -940,7 +942,10 @@ function TransactionForm({
           })}</span>
         </div>
       )}
-      {recurringLinked && !isCreating && (
+      {!isCreating && transaction && transaction.account_id && !transaction.is_ignored && (transaction.recurring_link || !recurringLinked) && (
+        <TransactionRecurrencePanel transaction={transaction} />
+      )}
+      {recurringLinked && !isCreating && !transaction?.recurring_link && (
         <div className="flex items-center justify-between gap-2 p-3 text-sm bg-muted/50 border border-border rounded-md">
           <span className="text-muted-foreground">{t('transactions.recurringLinkedInfo')}</span>
           <Button
@@ -1254,6 +1259,16 @@ function TransactionForm({
         )
       })()}
 
+      {!isCreating && transaction?.source === 'sync' && (
+        <TransactionSyncPanel
+          transaction={transaction}
+          onChanged={(updated) => {
+            setIsIgnored(updated.is_ignored)
+            onIgnoreChanged?.()
+          }}
+        />
+      )}
+
       {/* A settlement-sourced transaction *is* the movement clearing a
           group debt; splitting it would create circular accounting
           (the share would settle a debt that this debit is already
@@ -1355,7 +1370,7 @@ function TransactionForm({
                 <select
                   className="w-full border border-border rounded-md px-3 py-2 text-sm bg-card focus:outline-none focus-visible:ring-ring/30 focus-visible:ring-[2px]"
                   value={installmentFrequency}
-                  onChange={(e) => setInstallmentFrequency(e.target.value as RecurringTransaction['frequency'])}
+                  onChange={(e) => setInstallmentFrequency(e.target.value as Exclude<RecurringTransaction['frequency'], 'weekly_billed_monthly'>)}
                 >
                   <option value="monthly">{t('recurring.monthly')}</option>
                   <option value="quarterly">{t('recurring.quarterly')}</option>

@@ -1,6 +1,13 @@
 import axios from 'axios'
 import type { NumberFormat, DateFormat } from '@/lib/format'
 import type {
+  RecurringSuggestion,
+  InstallmentPlansResponse,
+  CardStatementsResponse,
+  RuleScopeKind,
+  PluggyCredential,
+  PluggyCredentialOption,
+  PluggyStatus,
   User,
   AdminUser,
   AdminUserList,
@@ -380,9 +387,16 @@ export const connections = {
     const { data } = await api.get('/connections/providers')
     return data.providers
   },
-  getConnectToken: async (provider = 'pluggy'): Promise<string> => {
-    const { data } = await api.post('/connections/connect-token', { provider })
+  getConnectToken: async (provider = 'pluggy', pluggyCredentialId?: string): Promise<string> => {
+    const { data } = await api.post('/connections/connect-token', {
+      provider,
+      pluggy_credential_id: pluggyCredentialId,
+    })
     return data.access_token
+  },
+  pluggyCredentials: async (): Promise<PluggyCredentialOption[]> => {
+    const { data } = await api.get('/connections/pluggy-credentials')
+    return data
   },
   getOAuthUrl: async (provider: string, flow_params?: Record<string, unknown>): Promise<string> => {
     const { data } = await api.post('/connections/oauth/url', { provider, flow_params })
@@ -415,12 +429,14 @@ export const connections = {
     state?: string,
     settings?: Pick<ConnectionSettings, 'sync_assets'>,
     reconnectConnectionId?: string,
+    pluggyCredentialId?: string,
   ): Promise<BankConnection> => {
     const { data } = await api.post('/connections/oauth/callback', {
       code,
       provider,
       state,
       reconnect_connection_id: reconnectConnectionId,
+      pluggy_credential_id: pluggyCredentialId,
       ...settings,
     })
     return data
@@ -487,6 +503,18 @@ export const accounts = {
     const { data } = await api.get(`/accounts/${id}/balance-history`, { params: { from, to } })
     return data
   },
+  statements: async (id: string): Promise<CardStatementsResponse> => {
+    const { data } = await api.get(`/accounts/${id}/statements`)
+    return data
+  },
+  installmentPlans: async (id: string): Promise<InstallmentPlansResponse> => {
+    const { data } = await api.get(`/accounts/${id}/installment-plans`)
+    return data
+  },
+  recompute: async (id: string): Promise<Record<string, unknown>> => {
+    const { data } = await api.post(`/accounts/${id}/recompute`)
+    return data
+  },
   bills: async (id: string, limit = 24): Promise<CreditCardBill[]> => {
     const { data } = await api.get(`/accounts/${id}/bills`, { params: { limit } })
     return data
@@ -524,6 +552,8 @@ export const transactions = {
     exclude_transfers?: boolean
     user_pnl_only?: boolean
     exclude_ignored?: boolean
+    sync_state?: 'removed' | 'duplicate'
+    statement_month?: string
     tags?: string[]
     min_amount?: number
     max_amount?: number
@@ -582,6 +612,42 @@ export const transactions = {
   },
   unlinkRecurring: async (id: string): Promise<Transaction> => {
     const { data } = await api.patch(`/transactions/${id}/unlink-recurring`)
+    return data
+  },
+  linkInstallmentPlan: async (id: string, planId: string | 'new' | null): Promise<Transaction> => {
+    const { data } = await api.post(`/transactions/${id}/installment-plan`, { plan_id: planId })
+    return data
+  },
+  confirmInstallmentPlan: async (id: string): Promise<Transaction> => {
+    const { data } = await api.post(`/transactions/${id}/installment-plan/confirm`)
+    return data
+  },
+  mergeInstallmentPlans: async (planId: string, intoPlanId: string): Promise<{ plan_id: string }> => {
+    const { data } = await api.post(`/installment-plans/${planId}/merge`, { into_plan_id: intoPlanId })
+    return data
+  },
+  recurringDraft: async (id: string): Promise<Partial<RecurringTransaction>> => {
+    const { data } = await api.get(`/transactions/${id}/recurring-draft`)
+    return data
+  },
+  linkRecurring: async (id: string, recurringId: string | 'none' | null): Promise<Transaction> => {
+    const { data } = await api.post(`/transactions/${id}/recurring`, { recurring_id: recurringId })
+    return data
+  },
+  reviewRecurring: async (id: string, decision: 'accept' | 'reject'): Promise<Transaction> => {
+    const { data } = await api.post(`/transactions/${id}/recurring/review`, { decision })
+    return data
+  },
+  confirmRecurring: async (id: string): Promise<Transaction> => {
+    const { data } = await api.post(`/transactions/${id}/recurring/confirm`)
+    return data
+  },
+  markNotDuplicate: async (id: string): Promise<Transaction> => {
+    const { data } = await api.post(`/transactions/${id}/not-duplicate`)
+    return data
+  },
+  setSyncLock: async (id: string, locked: boolean): Promise<Transaction> => {
+    const { data } = await api.post(`/transactions/${id}/sync-lock`, { locked })
     return data
   },
   createTransfer: async (transfer: {
@@ -720,6 +786,7 @@ export const transactions = {
     q?: string
     tags?: string[]
     exclude_ignored?: boolean
+    sync_state?: 'removed' | 'duplicate'
     transaction_ids?: string[]
   }): Promise<void> => {
     const { data } = await api.get('/transactions/export', {
@@ -1048,6 +1115,8 @@ export const rules = {
     is_active?: boolean
     apply_to_existing?: boolean
     overwrite_existing_categories?: boolean
+    scope_account_kind?: RuleScopeKind | null
+    scope_account_id?: string | null
     /** One window of the matches: `limit` of them starting at `offset`,
      * newest first. The counts are exact whatever the window is. */
     limit?: number
@@ -1076,8 +1145,12 @@ export const rules = {
     const { data } = await api.post('/rules/import', { payload, overwrite })
     return data
   },
-  packs: async (): Promise<{ code: string; name: string; flag: string; rule_count: number; installed: boolean }[]> => {
+  packs: async (): Promise<{ code: string; name: string; flag: string; rule_count: number; installed: boolean; builtin?: boolean }[]> => {
     const { data } = await api.get('/rules/packs')
+    return data
+  },
+  restorePack: async (packCode: string): Promise<{ created: number; restored: number }> => {
+    const { data } = await api.post(`/rules/packs/${packCode}/restore`)
     return data
   },
   installPack: async (
@@ -1223,6 +1296,26 @@ export const recurring = {
   generate: async (): Promise<{ generated: number }> => {
     const { data } = await api.post('/recurring-transactions/generate')
     return data
+  },
+  timeline: async (id: string): Promise<RecurringTransaction> => {
+    const { data } = await api.get(`/recurring-transactions/${id}/timeline`)
+    return data
+  },
+  end: async (id: string, date?: string): Promise<RecurringTransaction> => {
+    const { data } = await api.post(`/recurring-transactions/${id}/end`, { date })
+    return data
+  },
+  // Mark one occurrence as not happening (skipped=false undoes it).
+  skip: async (id: string, period: string, skipped = true): Promise<RecurringTransaction> => {
+    const { data } = await api.post(`/recurring-transactions/${id}/skip`, { period, skipped })
+    return data
+  },
+  suggestions: async (accountId: string): Promise<RecurringSuggestion[]> => {
+    const { data } = await api.get(`/accounts/${accountId}/recurring-suggestions`)
+    return data
+  },
+  dismissSuggestion: async (accountId: string, key: string): Promise<void> => {
+    await api.post(`/accounts/${accountId}/recurring-suggestions/dismiss`, { key })
   },
 }
 
@@ -1525,6 +1618,37 @@ export const reports = {
     })
     return data
   },
+  // From `pastMonths` before the reference date to `futureMonths` after it,
+  // for any report kind. Points after today carry an `estimate` next to their
+  // known value.
+  window: async (
+    kind: 'net_worth' | 'income_expenses' | 'cash_flow',
+    opts: {
+      referenceDate: string
+      pastMonths: number
+      futureMonths: number
+      interval: string
+      accountIds?: string[]
+      assetGroupIds?: string[]
+    },
+  ): Promise<ReportResponse> => {
+    const path = kind === 'net_worth' ? 'net-worth' : kind === 'income_expenses' ? 'income-expenses' : 'cash-flow'
+    const hasFilter = (opts.accountIds && opts.accountIds.length > 0)
+      || (kind === 'net_worth' && opts.assetGroupIds && opts.assetGroupIds.length > 0)
+    const { data } = await api.get(`/reports/${path}`, {
+      params: {
+        reference_date: opts.referenceDate,
+        past_months: opts.pastMonths,
+        future_months: opts.futureMonths,
+        interval: opts.interval,
+        ...(opts.accountIds && opts.accountIds.length > 0 ? { account_ids: opts.accountIds } : {}),
+        ...(kind === 'net_worth' && opts.assetGroupIds && opts.assetGroupIds.length > 0
+          ? { asset_group_ids: opts.assetGroupIds } : {}),
+      },
+      ...(hasFilter ? { paramsSerializer: { indexes: null as null } } : {}),
+    })
+    return data
+  },
   cashFlow: async (months = 6, interval = 'daily', baseline = false, accountIds?: string[]): Promise<ReportResponse> => {
     const extra = acctIdsParam(accountIds)
     const { data } = await api.get('/reports/cash-flow', { params: { months, interval, baseline, ...(extra.params ?? {}) }, ...(extra.paramsSerializer ? { paramsSerializer: extra.paramsSerializer } : {}) })
@@ -1668,6 +1792,28 @@ export const admin = {
   defaultColors: async (): Promise<{ light: string | null; dark: string | null }> => {
     const { data } = await api.get('/admin/default-colors')
     return data
+  },
+  pluggyCredentials: async (): Promise<PluggyCredential[]> => {
+    const { data } = await api.get('/admin/pluggy-credentials')
+    return data
+  },
+  pluggyStatus: async (): Promise<PluggyStatus> => {
+    const { data } = await api.get('/admin/pluggy-credentials/status')
+    return data
+  },
+  createPluggyCredential: async (payload: { name: string; client_id: string; client_secret: string }): Promise<PluggyCredential> => {
+    const { data } = await api.post('/admin/pluggy-credentials', payload)
+    return data
+  },
+  updatePluggyCredential: async (
+    id: string,
+    payload: Partial<{ name: string; client_id: string; client_secret: string }>,
+  ): Promise<PluggyCredential> => {
+    const { data } = await api.patch(`/admin/pluggy-credentials/${id}`, payload)
+    return data
+  },
+  deletePluggyCredential: async (id: string): Promise<void> => {
+    await api.delete(`/admin/pluggy-credentials/${id}`)
   },
 }
 

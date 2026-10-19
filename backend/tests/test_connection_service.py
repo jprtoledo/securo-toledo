@@ -339,7 +339,7 @@ async def test_update_settings_sync_assets(session: AsyncSession, test_user, tes
 
 @pytest.mark.asyncio
 async def test_oauth_callback_respects_initial_asset_sync_opt_out(
-    session: AsyncSession, test_user, test_workspace
+    pluggy_credential, session: AsyncSession, test_user, test_workspace
 ):
     """Initial connection creation can opt out before holdings are imported."""
     mock_provider = AsyncMock()
@@ -682,7 +682,7 @@ async def test_create_connect_token_success(test_user):
 
 
 @pytest.mark.asyncio
-async def test_handle_oauth_callback_creates_connection(session: AsyncSession, test_user, test_workspace):
+async def test_handle_oauth_callback_creates_connection(pluggy_credential, session: AsyncSession, test_user, test_workspace):
     mock_provider = AsyncMock()
     mock_provider.handle_oauth_callback = AsyncMock(return_value=ConnectionData(
         external_id="ext-oauth-1",
@@ -723,7 +723,7 @@ async def test_handle_oauth_callback_creates_connection(session: AsyncSession, t
 
 @pytest.mark.asyncio
 async def test_handle_oauth_callback_names_disambiguated_account_from_institution(
-    session: AsyncSession, test_user, test_workspace,
+    pluggy_credential, session: AsyncSession, test_user, test_workspace,
 ):
     """A connection spanning a banking group's brokerage arm (issue #723) sends
     a per-account institution hint. The account's display_name adopts it on
@@ -794,7 +794,7 @@ async def test_handle_oauth_callback_deduplicates_initial_transactions(
 
 
 @pytest.mark.asyncio
-async def test_handle_oauth_callback_with_payee(session: AsyncSession, test_user, test_workspace):
+async def test_handle_oauth_callback_with_payee(pluggy_credential, session: AsyncSession, test_user, test_workspace):
     mock_provider = AsyncMock()
     mock_provider.handle_oauth_callback = AsyncMock(return_value=ConnectionData(
         external_id="ext-oauth-2",
@@ -2129,7 +2129,7 @@ async def test_incremental_sync_reuses_latest_installment_category_when_provider
 
 @pytest.mark.asyncio
 async def test_oauth_callback_rule_category_wins_over_provider_category(
-    session: AsyncSession, test_user, test_workspace
+    pluggy_credential, session: AsyncSession, test_user, test_workspace
 ):
     """Same precedence guarantee as
     `test_sync_rule_category_wins_over_provider_category`, but for the
@@ -2397,7 +2397,7 @@ async def test_sync_connection_does_not_revive_ignored_transaction(
 
 @pytest.mark.asyncio
 async def test_oauth_callback_persists_installment_metadata(
-    session: AsyncSession, test_user, test_workspace,
+    pluggy_credential, session: AsyncSession, test_user, test_workspace,
 ):
     """handle_oauth_callback must store all 4 installment fields on the
     Transaction row exactly as the provider returned them."""

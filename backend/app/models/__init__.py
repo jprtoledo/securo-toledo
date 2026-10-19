@@ -3,6 +3,7 @@ from app.models.passkey import UserPasskey
 from app.models.workspace import Workspace, WorkspaceMember, WorkspaceTaxId
 from app.models.category import Category
 from app.models.category_group import CategoryGroup
+from app.models.pluggy_credential import PluggyCredential
 from app.models.bank_connection import BankConnection
 from app.models.institution import Institution
 from app.models.account import Account
@@ -21,6 +22,8 @@ from app.models.payee import Payee, PayeeMapping, PayeeTaxId
 from app.models.app_settings import AppSetting
 from app.models.goal import Goal
 from app.models.credit_card_bill import CreditCardBill
+from app.models.installment_plan import InstallmentPlan
+from app.models.recurring_suggestion_dismissal import RecurringSuggestionDismissal
 from app.models.group import Group, GroupMember
 from app.models.transaction_split import TransactionSplit
 from app.models.group_settlement import GroupSettlement
@@ -55,6 +58,7 @@ __all__ = [
     "WorkspaceTaxId",
     "Category",
     "CategoryGroup",
+    "PluggyCredential",
     "BankConnection",
     "Institution",
     "Account",
@@ -75,6 +79,8 @@ __all__ = [
     "AppSetting",
     "Goal",
     "CreditCardBill",
+    "InstallmentPlan",
+    "RecurringSuggestionDismissal",
     "Group",
     "GroupMember",
     "TransactionSplit",

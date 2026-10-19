@@ -118,7 +118,7 @@ async def test_unlink_transfer_not_found(client: AsyncClient, auth_headers):
 
 
 @pytest.mark.asyncio
-async def test_create_connect_token_success(client: AsyncClient, auth_headers):
+async def test_create_connect_token_success(pluggy_credential, client: AsyncClient, auth_headers):
     mock_token = MagicMock()
     mock_token.access_token = "test-token-123"
     with patch("app.services.connection_service.get_provider") as mock_gp:
@@ -145,7 +145,7 @@ async def test_create_connect_token_value_error(client: AsyncClient, auth_header
 
 
 @pytest.mark.asyncio
-async def test_create_connect_token_server_error(client: AsyncClient, auth_headers):
+async def test_create_connect_token_server_error(pluggy_credential, client: AsyncClient, auth_headers):
     with patch("app.services.connection_service.get_provider") as mock_gp:
         mock_gp.return_value.create_connect_token = AsyncMock(
             side_effect=RuntimeError("Provider down")
@@ -159,7 +159,7 @@ async def test_create_connect_token_server_error(client: AsyncClient, auth_heade
 
 
 @pytest.mark.asyncio
-async def test_oauth_callback_success(client: AsyncClient, auth_headers):
+async def test_oauth_callback_success(pluggy_credential, client: AsyncClient, auth_headers):
     conn_data = MagicMock()
     conn_data.external_id = "ext-oauth-1"
     conn_data.institution_name = "Test Bank"

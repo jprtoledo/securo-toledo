@@ -304,13 +304,20 @@ generate_env() {
     SECRET_KEY=$(head -c 32 /dev/urandom | xxd -p | tr -d '\n')
   fi
 
+  if command -v openssl &> /dev/null; then
+    CREDENTIALS_ENCRYPTION_KEY=$(openssl rand -base64 32)
+  else
+    CREDENTIALS_ENCRYPTION_KEY=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+  fi
+
   cat > .env <<EOF
 SECRET_KEY=$SECRET_KEY
+CREDENTIALS_ENCRYPTION_KEY=$CREDENTIALS_ENCRYPTION_KEY
 PLUGGY_CLIENT_ID=
 PLUGGY_CLIENT_SECRET=
 EOF
 
-  success ".env file created with a random SECRET_KEY"
+  success ".env file created with a random SECRET_KEY and CREDENTIALS_ENCRYPTION_KEY"
 }
 
 # ── Start Services ───────────────────────────────────────────────────────────

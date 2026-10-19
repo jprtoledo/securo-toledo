@@ -19,6 +19,7 @@ from app.schemas.account import (
     AccountUpdate,
     CreditCardBillRead,
 )
+from app.schemas.recurring_transaction import SuggestionDismissRequest
 from app.services import account_service
 from app.services.fx_rate_service import convert
 
@@ -128,6 +129,99 @@ async def get_account_bills(
     if bills is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
     return bills
+
+
+@router.get("/{account_id}/statements", response_model=dict)
+async def get_account_statements(
+    account_id: uuid.UUID,
+    ctx: WorkspaceContext = Depends(current_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """One entry per bill month, from the first bill or row to the last
+    future parcel (RFC toledo-features §6.4): state, status, totals,
+    payments, reconciliation and projections."""
+    from app.services.card_statement_service import get_statements
+
+    account = await account_service.get_account(session, account_id, ctx.workspace.id)
+    if not account:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
+    if account.type != "credit_card":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not a credit card")
+    return await get_statements(session, account)
+
+
+@router.get("/{account_id}/installment-plans", response_model=dict)
+async def get_installment_plans(
+    account_id: uuid.UUID,
+    ctx: WorkspaceContext = Depends(current_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """The card's installment plans with each parcel's timeline: posted,
+    projected, missing (closed month the bank did not send) or before the
+    history (RFC toledo-features §7.3)."""
+    from app.core.app_clock import app_today
+    from app.services.installment_plan_service import plan_view
+
+    account = await account_service.get_account(session, account_id, ctx.workspace.id)
+    if not account:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
+    return await plan_view(session, account, today=app_today())
+
+
+@router.get("/{account_id}/recurring-suggestions", response_model=list[dict])
+async def get_recurring_suggestions(
+    account_id: uuid.UUID,
+    ctx: WorkspaceContext = Depends(current_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Recurring charges the history suggests (RFC toledo-features §8.6),
+    each a complete recurrence draft."""
+    from dataclasses import asdict
+
+    from app.services.recurrence_service import suggestions_for
+
+    account = await account_service.get_account(session, account_id, ctx.workspace.id)
+    if not account:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
+    return [
+        {**asdict(s), "account_id": account.id}
+        for s in await suggestions_for(session, account)
+    ]
+
+
+@router.post("/{account_id}/recurring-suggestions/dismiss", status_code=status.HTTP_204_NO_CONTENT)
+async def dismiss_recurring_suggestion(
+    account_id: uuid.UUID,
+    data: SuggestionDismissRequest,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    from app.services.recurrence_service import dismiss_suggestion
+
+    account = await account_service.get_account(session, account_id, ctx.workspace.id)
+    if not account:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
+    await dismiss_suggestion(session, account, data.key)
+    await session.commit()
+
+
+@router.post("/{account_id}/recompute", response_model=dict)
+async def recompute_account(
+    account_id: uuid.UUID,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Re-derive the account's computed columns now and report what moved
+    (RFC toledo-features §5.1; a debugging aid, recompute normally runs on
+    its own after syncs and decisions)."""
+    from app.services.recompute_service import recompute_account as run_recompute
+
+    account = await account_service.get_account(session, account_id, ctx.workspace.id)
+    if not account:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
+    stats = await run_recompute(session, account.id)
+    await session.commit()
+    return stats.as_dict()
 
 
 @router.get("/{account_id}", response_model=AccountRead)

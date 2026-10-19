@@ -19,7 +19,7 @@ from app.services.fx_rate_service import stamp_primary_amount
 
 async def _verify_account_in_workspace(
     session: AsyncSession, workspace_id: uuid.UUID, account_id: uuid.UUID
-) -> None:
+) -> Account:
     """Raise ValueError if the account isn't reachable from this workspace."""
     result = await session.execute(
         select(Account)
@@ -32,8 +32,88 @@ async def _verify_account_in_workspace(
             ),
         )
     )
-    if result.scalar_one_or_none() is None:
+    account = result.scalar_one_or_none()
+    if account is None:
         raise ValueError("Account not found")
+    return account
+
+
+V2_FIELDS = (
+    "match_condition", "amount_mode", "amount_tolerance_pct", "day_window",
+    "billing_weekday", "week_count_basis",
+)
+
+
+async def _validate_v2(
+    session: AsyncSession, account_id: Optional[uuid.UUID], values: dict
+) -> None:
+    """Recurrences v2 inputs (RFC toledo-features §8.2): the condition must be
+    valid in the rules language for the account's kind, and weekly billed
+    monthly needs its weekday and day."""
+    from app.services.rule_engine import account_kind_of, rule_definition_errors
+
+    condition = values.get("match_condition")
+    if condition:
+        account = await session.get(Account, account_id) if account_id else None
+        kind = account_kind_of(account.type) if account else None
+        errors = rule_definition_errors(
+            kind if kind in ("bank", "credit_card") else None, "and", [condition], []
+        )
+        if errors:
+            raise ValueError(errors[0]["message"])
+    if values.get("frequency") == "weekly_billed_monthly":
+        if values.get("billing_weekday") is None:
+            raise ValueError("billing_weekday is required for weekly billed monthly")
+        if not values.get("day_of_month"):
+            raise ValueError("day_of_month (the billing day) is required for weekly billed monthly")
+
+
+async def _validate_extra_accounts(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    account_id: Optional[uuid.UUID],
+    extra_ids: Optional[list],
+    *,
+    auto_generate: bool,
+    condition: Optional[dict],
+) -> Optional[list[str]]:
+    """Other accounts that may pay the recurrence: in the workspace, not
+    its own account, and only on computed recurrences (the placeholder
+    generator works on one account). Returns the stored form."""
+    from app.services.account_service import get_account_name
+    from app.services.rule_engine import account_kind_of, rule_definition_errors
+
+    ids = list(dict.fromkeys(uuid.UUID(str(a)) for a in extra_ids or [] if uuid.UUID(str(a)) != account_id))
+    if not ids:
+        return None
+    if auto_generate:
+        raise ValueError("Only recurrences that are not auto-generated can be paid from several accounts")
+    for extra_id in ids:
+        account = await _verify_account_in_workspace(session, workspace_id, extra_id)
+        if condition:
+            kind = account_kind_of(account.type)
+            errors = rule_definition_errors(
+                kind if kind in ("bank", "credit_card") else None, "and", [condition], []
+            )
+            if errors:
+                raise ValueError(f"{get_account_name(account)}: {errors[0]['message']}")
+    return [str(a) for a in ids]
+
+
+async def recompute_recurrence_account(
+    session: AsyncSession, account_id: Optional[uuid.UUID]
+) -> Optional[dict]:
+    """Every recurrence change re-links its account (RFC §8.7); returns the
+    link stats."""
+    if account_id is None:
+        return None
+    from app.services.recompute_service import recompute_account
+
+    stats = await recompute_account(session, account_id)
+    await session.commit()
+    return {
+        k: stats.extra.get(k, 0) for k in ("recurrences", "linked", "recurring_conflicts")
+    }
 
 
 async def get_recurring_transactions(
@@ -64,6 +144,11 @@ async def create_recurring_transaction(
     data: RecurringTransactionCreate,
 ) -> RecurringTransaction:
     await _verify_account_in_workspace(session, workspace_id, data.account_id)
+    await _validate_v2(session, data.account_id, data.model_dump())
+    extra_account_ids = await _validate_extra_accounts(
+        session, workspace_id, data.account_id, data.extra_account_ids,
+        auto_generate=data.auto_generate, condition=data.match_condition,
+    )
     next_occ = data.start_date
     if data.skip_first:
         next_occ = _advance_date(
@@ -86,6 +171,17 @@ async def create_recurring_transaction(
         end_date=data.end_date,
         auto_generate=data.auto_generate,
         next_occurrence=next_occ,
+        match_condition=data.match_condition,
+        amount_mode=data.amount_mode or "fixed",
+        amount_tolerance_pct=data.amount_tolerance_pct or 0,
+        day_window=data.day_window,
+        billing_weekday=data.billing_weekday,
+        week_count_basis=(
+            data.week_count_basis or "previous_month"
+            if data.frequency == "weekly_billed_monthly" else data.week_count_basis
+        ),
+        origin=getattr(data, "origin", None) or "manual",
+        extra_account_ids=extra_account_ids,
     )
     session.add(recurring)
     await session.flush()
@@ -94,6 +190,8 @@ async def create_recurring_transaction(
         date_field="start_date",
     )
     await session.commit()
+    await session.refresh(recurring)
+    recurring.link_stats = await recompute_recurrence_account(session, recurring.account_id)
     await session.refresh(recurring)
     return recurring
 
@@ -125,8 +223,28 @@ async def update_recurring_transaction(
         for key in _SCHEDULE_FIELDS
     )
     previous_next_occurrence = recurring.next_occurrence
+    previous_account_id = recurring.account_id
+    previous_extra_ids = set(recurring.extra_account_ids or [])
+    extra_touched = "extra_account_ids" in update_data
+    extra_ids = update_data.pop("extra_account_ids", recurring.extra_account_ids)
+    if extra_touched or any(k in update_data for k in ("account_id", "auto_generate", "match_condition")):
+        recurring.extra_account_ids = await _validate_extra_accounts(
+            session, workspace_id, update_data.get("account_id", recurring.account_id), extra_ids,
+            auto_generate=update_data.get("auto_generate", recurring.auto_generate),
+            condition=update_data.get("match_condition", recurring.match_condition),
+        )
+    if any(k in update_data for k in (*V2_FIELDS, "frequency", "day_of_month")):
+        merged = {
+            k: update_data.get(k, getattr(recurring, k))
+            for k in (*V2_FIELDS, "frequency", "day_of_month")
+        }
+        await _validate_v2(session, update_data.get("account_id", recurring.account_id), merged)
 
     for key, value in update_data.items():
+        if key == "amount_tolerance_pct" and value is None:
+            value = 0
+        if key == "amount_mode" and value is None:
+            value = "fixed"
         setattr(recurring, key, value)
 
     if schedule_changed:
@@ -139,6 +257,65 @@ async def update_recurring_transaction(
 
     await session.commit()
     await session.refresh(recurring)
+    # Accounts that no longer pay it drop their links.
+    dropped = {previous_account_id, *(uuid.UUID(a) for a in previous_extra_ids)} - {
+        recurring.account_id, *(uuid.UUID(a) for a in recurring.extra_account_ids or []),
+    }
+    for account_id in dropped:
+        await recompute_recurrence_account(session, account_id)
+    recurring.link_stats = await recompute_recurrence_account(session, recurring.account_id)
+    await session.refresh(recurring)
+    return recurring
+
+
+async def end_recurring_transaction(
+    session: AsyncSession, recurring_id: uuid.UUID, workspace_id: uuid.UUID, end: Optional[date]
+) -> Optional[RecurringTransaction]:
+    """"End recurrence" (RFC §8.5): ``end`` or, by default, the last missed
+    period — the one that made Securo suggest ending it."""
+    recurring = await get_recurring_transaction(session, recurring_id, workspace_id)
+    if not recurring:
+        return None
+    if end is None:
+        from app.services.recurrence_service import timeline_for
+
+        view = await timeline_for(session, recurring)
+        end = view.alerts.get("last_missed") or app_today()
+    recurring.end_date = end
+    await session.commit()
+    recurring.link_stats = await recompute_recurrence_account(session, recurring.account_id)
+    await session.refresh(recurring)
+    return recurring
+
+
+async def skip_recurring_period(
+    session: AsyncSession, recurring_id: uuid.UUID, workspace_id: uuid.UUID, period: date, skipped: bool = True,
+) -> Optional[RecurringTransaction]:
+    """Mark one occurrence as not happening (or undo it): reports and
+    forecasts count every occurrence still to come, except skipped ones."""
+    from app.services.recompute.recurrences import periods_of
+    from app.services.recurrence_service import timeline_for, to_config
+
+    recurring = await get_recurring_transaction(session, recurring_id, workspace_id)
+    if not recurring:
+        return None
+    if recurring.auto_generate or recurring.account_id is None:
+        raise ValueError("Only computed recurrences with an account can skip an occurrence")
+    if period not in periods_of(to_config(recurring), recurring.start_date, period):
+        raise ValueError(f"{period.isoformat()} is not an occurrence of this recurrence")
+    current = set(recurring.skipped_periods or [])
+    if skipped:
+        view = await timeline_for(session, recurring)
+        if any(s.period == period and s.transaction_ids for s in view.timeline):
+            raise ValueError("This occurrence already has a linked transaction")
+        current.add(period.isoformat())
+    else:
+        current.discard(period.isoformat())
+    # A new list, so the JSON column is flagged as changed.
+    recurring.skipped_periods = sorted(current) or None
+    await session.commit()
+    recurring.link_stats = await recompute_recurrence_account(session, recurring.account_id)
+    await session.refresh(recurring)
     return recurring
 
 
@@ -149,8 +326,11 @@ async def delete_recurring_transaction(
     if not recurring:
         return False
 
+    account_ids = [recurring.account_id, *(uuid.UUID(a) for a in recurring.extra_account_ids or [])]
     await session.delete(recurring)
     await session.commit()
+    for account_id in account_ids:
+        await recompute_recurrence_account(session, account_id)
     return True
 
 

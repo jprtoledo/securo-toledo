@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -54,3 +55,36 @@ class TimezoneSettingRead(BaseModel):
     #: Where the application lands without a saved value (TZ, host, UTC).
     fallback: str
     available: list[str]
+
+
+class PluggyCredentialRead(BaseModel):
+    """A Pluggy application as the admin page sees it. Never carries the
+    client id or the secret — only the clear hint of the client id."""
+
+    id: uuid.UUID
+    name: str
+    client_id_hint: str
+    connection_count: int = 0
+    last_error: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PluggyCredentialCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    client_id: str = Field(min_length=1, max_length=500)
+    client_secret: str = Field(min_length=1, max_length=500)
+
+
+class PluggyCredentialUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    # Blank or omitted = keep the stored value.
+    client_id: Optional[str] = Field(None, max_length=500)
+    client_secret: Optional[str] = Field(None, max_length=500)
+
+
+class PluggyStatusRead(BaseModel):
+    configured: bool
+    encryption_key_configured: bool
+    reason: Optional[str] = None
+    credential_count: int

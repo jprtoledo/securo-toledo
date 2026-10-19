@@ -38,6 +38,7 @@ async def account(session: AsyncSession, test_user, test_workspace) -> Account:
 
 async def _make_bill(session, test_workspace, test_user, account, **overrides):
     data = RecurringTransactionCreate(
+        auto_generate=overrides.pop("auto_generate", True),
         description=overrides.pop("description", "Netflix Subscription"),
         amount=overrides.pop("amount", Decimal("39.90")),
         currency=overrides.pop("currency", "BRL"),

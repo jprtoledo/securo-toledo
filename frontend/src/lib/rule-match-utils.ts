@@ -1,7 +1,7 @@
 import { flattenConditions } from './rule-conditions'
 import type { Category, Rule } from '../types'
 
-export function normalizeRuleMatchValue(value: string | number): string {
+export function normalizeRuleMatchValue(value: unknown): string {
   return String(value ?? '')
     .trim()
     .toUpperCase()

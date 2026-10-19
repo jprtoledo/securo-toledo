@@ -19,6 +19,7 @@ from app.services._query_filters import (
     counts_as_user_pnl,
     owner_split_offset_by_category,
     owner_split_offset_pnl,
+    reporting_date,
     reporting_date_col,
     viewer_shared_pnl,
     viewer_shared_spending_by_category,
@@ -67,6 +68,78 @@ async def _materialized_recurring_occurrences(
     }
 
 
+async def reference_month_cards(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    account_ids: Optional[list[uuid.UUID]] = None,
+) -> list[Account]:
+    """Pluggy credit cards: their charges are bucketed by statement month
+    (RFC toledo-features §6.2) and forecast by the statements engine."""
+    stmt = (
+        select(Account)
+        .join(BankConnection, BankConnection.id == Account.connection_id)
+        .where(
+            Account.workspace_id == workspace_id,
+            Account.type == "credit_card",
+            Account.is_closed == False,  # noqa: E712
+            BankConnection.provider == "pluggy",
+        )
+    )
+    if account_ids is not None:
+        stmt = stmt.where(Account.id.in_(account_ids))
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def _card_statement_projections(
+    session: AsyncSession,
+    cards: list[Account],
+    month_start: date,
+    month_end: date,
+    include_transfer_like: bool,
+    cache: Optional[dict] = None,
+) -> list[dict]:
+    """Parcels still to come and expected recurring charges of the card
+    statements due in [month_start, month_end), as projection rows. The
+    statements engine runs once per card per ``cache``."""
+    from app.services.projection_service import card_projections
+
+    today = app_today()
+    if month_end <= today.replace(day=1):
+        return []  # only open and future statements carry projections
+    out: list[dict] = []
+    excluded: Optional[set] = None
+    cache = {} if cache is None else cache
+    for card in cards:
+        key = ("card_projections", card.id, today)
+        if key not in cache:
+            cache[key] = await card_projections(session, card, today=today)
+        for p in cache[key]:
+            if not (month_start <= p.month < month_end) or p.amount == 0:
+                continue
+            label = p.label or {}
+            category_id = uuid.UUID(label["category_id"]) if label.get("category_id") else None
+            if category_id is not None:
+                if excluded is None:
+                    flagged = (
+                        Category.is_ignored.is_(True)
+                        if include_transfer_like
+                        else or_(Category.is_ignored.is_(True), Category.treat_as_transfer.is_(True))
+                    )
+                    excluded = set((await session.execute(select(Category.id).where(flagged))).scalars().all())
+                if category_id in excluded:
+                    continue
+            out.append({
+                "category_id": category_id,
+                "amount": float(abs(p.amount)),
+                "type": "debit" if p.amount > 0 else "credit",
+                "currency": card.currency,
+                "date": p.month,
+                "account_id": card.id,
+                "source": p.source,
+            })
+    return out
+
+
 async def _get_recurring_projections(
     session: AsyncSession,
     workspace_id: uuid.UUID,
@@ -75,6 +148,8 @@ async def _get_recurring_projections(
     account_ids: Optional[list[uuid.UUID]] = None,
     *,
     include_transfer_like: bool = False,
+    statement_months: Optional[bool] = None,
+    cache: Optional[dict] = None,
 ) -> list[dict]:
     """Compute virtual recurring transaction projections for a month.
     Pure read — no DB writes. Returns list of dicts with category_id, amount, type, currency.
@@ -85,9 +160,18 @@ async def _get_recurring_projections(
     Transfer-like categories are excluded by default because most callers use
     these rows for P&L, budgets, reports, or spending. Balance projections can
     opt in because transfers and investment applications still move cash in
-    the affected account. Ignored categories never participate."""
+    the affected account. Ignored categories never participate.
+
+    ``statement_months`` (default: the P&L callers, i.e. without
+    transfer-like rows) forecasts Pluggy cards by statement month: their
+    recurrences are replaced by the statements engine's projections —
+    parcels still to come and expected recurring charges — so a forecast
+    lands in the month the bill does, like the card's actual rows."""
     if account_ids is not None and len(account_ids) == 0:
         return []
+    by_statement = (not include_transfer_like) if statement_months is None else statement_months
+    cards = await reference_month_cards(session, workspace_id, account_ids) if by_statement else []
+    card_ids = {c.id for c in cards}
     filters = [
         RecurringTransaction.workspace_id == workspace_id,
         RecurringTransaction.is_active == True,
@@ -110,7 +194,7 @@ async def _get_recurring_projections(
     if account_ids:
         stmt = stmt.where(RecurringTransaction.account_id.in_(account_ids))
     result = await session.execute(stmt)
-    recurring_list = list(result.scalars().all())
+    recurring_list = [r for r in result.scalars().all() if r.account_id not in card_ids]
 
     # A recurrence may already have been materialized without its nominal
     # pointer being advanced yet (for example by generate-ahead workflows).
@@ -125,29 +209,60 @@ async def _get_recurring_projections(
     )
 
     projections = []
+    # Shared by callers that project month after month (one timeline per
+    # account instead of one per month).
+    cache = {} if cache is None else cache
     for rec in recurring_list:
         # Compute occurrences from the nominal pointer; linked rows are
         # filtered explicitly below because the pointer can lag materialization.
-        occurrences = get_occurrences_in_range(
-            start=rec.next_occurrence,
-            frequency=rec.frequency,
-            end_date=rec.end_date,
-            range_start=month_start,
-            range_end=month_end,
-            intended_day=rec.day_of_month or rec.start_date.day,
-            weekend_adjustment=rec.weekend_adjustment,
-        )
-        for occ_date in occurrences:
+        occurrences = await _occurrences(session, rec, month_start, month_end, cache)
+        for occ_date, occ_amount in occurrences:
             if (rec.id, occ_date) in materialized_occurrences:
                 continue
             projections.append({
                 "category_id": rec.category_id,
-                "amount": float(rec.amount),
+                "amount": float(occ_amount),
                 "type": rec.type,
                 "currency": rec.currency,
                 "date": occ_date,
+                "account_id": rec.account_id,
+                # Computed occurrences are never materialized: one dated
+                # before today is late and still to come.
+                "computed": not rec.auto_generate,
             })
+    if cards:
+        projections.extend(await _card_statement_projections(
+            session, cards, month_start, month_end, include_transfer_like, cache,
+        ))
     return projections
+
+
+async def _occurrences(
+    session: AsyncSession, rec: RecurringTransaction, range_start: date, range_end: date, cache: dict,
+) -> list[tuple[date, Decimal]]:
+    """Forecast occurrences of a recurrence in [range_start, range_end).
+
+    Recurrences that auto-generate placeholders project from their nominal
+    pointer as before. The others are computed (RFC toledo-features §8.5):
+    their expected and late slots, at the expected amount, never a period a
+    linked charge already fulfilled.
+    """
+    if rec.auto_generate:
+        return [
+            (d, Decimal(rec.amount))
+            for d in get_occurrences_in_range(
+                start=rec.next_occurrence,
+                frequency=rec.frequency,
+                end_date=rec.end_date,
+                range_start=range_start,
+                range_end=range_end,
+                intended_day=rec.day_of_month or rec.start_date.day,
+                weekend_adjustment=rec.weekend_adjustment,
+            )
+        ]
+    from app.services.recurrence_service import projected_occurrences
+
+    return await projected_occurrences(session, rec, range_start, range_end, cache=cache)
 
 
 async def _get_forecast_transactions(
@@ -199,11 +314,14 @@ async def _get_forecast_transactions(
 
 def _counts_as_user_pnl_row(tx: Transaction) -> bool:
     """Python equivalent of ``counts_as_user_pnl`` for loaded forecast rows."""
+    from app.services._query_filters import NON_SPENDING_CARD_LINES
+
     category = tx.category
     return not (
         tx.transfer_pair_id
         or tx.is_ignored
         or tx.exclude_from_pnl
+        or tx.card_line_kind in NON_SPENDING_CARD_LINES
         or tx.source == "settlement"
         or (category and (category.treat_as_transfer or category.is_ignored))
     )
@@ -987,10 +1105,7 @@ async def get_monthly_trend(
     for tx in forecast_transactions:
         if not _counts_as_user_pnl_row(tx):
             continue
-        tx_report_date = (
-            tx.effective_bill_date
-            or (tx.effective_date if accounting_mode == "accrual" else tx.date)
-        )
+        tx_report_date = reporting_date(tx, accounting_mode)
         month_key = f"{tx_report_date.year:04d}-{tx_report_date.month:02d}"
         bucket = trend_map.setdefault(month_key, [0.0, 0.0])
         if tx.amount_primary is not None:
@@ -1121,39 +1236,32 @@ async def get_projected_transactions(
             cat_map[row[0]] = (row[1], row[2], row[3])
 
     projections: list[ProjectedTransaction] = []
+    cache: dict = {}
     for rec in recurring_list:
-        occurrences = get_occurrences_in_range(
-            start=rec.next_occurrence,
-            frequency=rec.frequency,
-            end_date=rec.end_date,
-            range_start=range_start,
-            range_end=range_end,
-            intended_day=rec.day_of_month or rec.start_date.day,
-            weekend_adjustment=rec.weekend_adjustment,
-        )
+        occurrences = await _occurrences(session, rec, range_start, range_end, cache)
         cat_name, cat_icon, cat_color = cat_map.get(rec.category_id, (None, None, None)) if rec.category_id else (None, None, None)
 
         # Convert to primary currency at the latest real rate. A missing rate
         # stays unknown; virtual projections must never manufacture a 1:1
         # conversion just to render a number.
-        amt_primary = None
+        rate = None
         if rec.currency != primary_currency:
             rate = await _resolve_rate(
                 session, rec.currency, primary_currency,
             )
-            if rate is not None:
-                amt_primary = float(
-                    (Decimal(str(rec.amount)) * rate).quantize(Decimal("0.01"))
-                )
 
-        for occ_date in occurrences:
+        for occ_date, occ_amount in occurrences:
             if (rec.id, occ_date) in materialized_occurrences:
                 continue
+            amt_primary = (
+                float((Decimal(str(occ_amount)) * rate).quantize(Decimal("0.01")))
+                if rate is not None else None
+            )
             projections.append(ProjectedTransaction(
                 recurring_id=str(rec.id),
                 account_id=str(rec.account_id) if rec.account_id else None,
                 description=rec.description,
-                amount=float(rec.amount),
+                amount=float(occ_amount),
                 amount_primary=amt_primary,
                 currency=rec.currency,
                 type=rec.type,
@@ -1567,115 +1675,50 @@ async def get_balance_history(
     month: Optional[date] = None,
     account_ids: Optional[list[uuid.UUID]] = None,
 ) -> BalanceHistory:
-    if not month:
-        month = app_today().replace(day=1)
+    """The money in the accounts, day by day, over ``month`` — the same walk
+    as the cash flow report (credit cards leave on each bill's due date).
 
-    month_start, month_end = _month_range(month)
-    prev_month_start = (month_start - timedelta(days=1)).replace(day=1)
-    prev_month_end = month_start
+    ``current`` holds the actual days (up to today), ``forecast`` today and
+    the days after it: every recurrence, parcel and bill still to come. The
+    forecast is one walk from today, so a month opens where the previous
+    one's forecast closed. ``previous`` (the month before, for comparison)
+    is only sent while the month has actual days."""
+    from app.services.report_service import _cash_walk
 
     today = app_today()
-    is_current = month_start.year == today.year and month_start.month == today.month
+    if not month:
+        month = today.replace(day=1)
+    month_start, month_end = _month_range(month)
+    prev_month_start = (month_start - timedelta(days=1)).replace(day=1)
+    has_actuals = month_start <= today
     days_in_month = (month_end - month_start).days
-    cutoff_day = today.day if is_current else days_in_month
+    prev_days_in_month = (month_start - prev_month_start).days
 
-    prev_days_in_month = (prev_month_end - prev_month_start).days
-
-    # Look up the user's primary currency once so the helpers can avoid
-    # re-querying.
     user = await session.get(User, user_id)
     primary_currency = user.primary_currency if user else get_settings().default_currency
 
-    # Starting balances
-    current_start = await _balance_at(
-        session, workspace_id, month_start - timedelta(days=1),
-        primary_currency_hint=primary_currency, account_ids=account_ids,
-    )
-    prev_start = await _balance_at(
-        session, workspace_id, prev_month_start - timedelta(days=1),
-        primary_currency_hint=primary_currency, account_ids=account_ids,
+    first = (prev_month_start if has_actuals else month_start) - timedelta(days=1)
+    last_day = month_end - timedelta(days=1)
+    walk = await _cash_walk(
+        session, workspace_id, account_ids, primary_currency, today,
+        min(first, today), max(last_day, today),
     )
 
-    # Daily deltas from real transactions
-    current_deltas = await _daily_deltas(
-        session, workspace_id, month_start, month_end,
-        primary_currency_hint=primary_currency, account_ids=account_ids,
-    )
-    prev_deltas = await _daily_deltas(
-        session, workspace_id, prev_month_start, prev_month_end,
-        primary_currency_hint=primary_currency, account_ids=account_ids,
-    )
+    def at(d: date) -> float:
+        return round(walk.daily_balance.get(d, 0.0), 2)
 
-    # Recurring projections for future days of current month (converted to primary currency)
-    proj_deltas: dict[int, float] = {}
-    if month_end > today:
-        # A future month's chart starts from the posted-only current balance.
-        # Carry forecast rows dated before that month into its projected
-        # opening position. Connected accounts are the one exception: their
-        # provider snapshot is authoritative and may already include pending
-        # rows dated today or earlier.
-        if month_start > today:
-            carried_forecasts = await _get_forecast_transactions(
-                session, workspace_id, date.min, month_start, account_ids
-            )
-            for tx in carried_forecasts:
-                if tx.is_ignored or (tx.category and tx.category.is_ignored):
-                    continue
-                if tx.account and tx.account.connection_id and tx.status == "pending" and tx.date <= today:
-                    continue
-                current_start += await _signed_forecast_amount_primary(
-                    session, tx, primary_currency
-                )
-
-        proj_start = max(month_start, today + timedelta(days=1))
-        forecast_transactions = await _get_forecast_transactions(
-            session,
-            workspace_id,
-            proj_start,
-            month_end,
-            account_ids,
-        )
-        for tx in forecast_transactions:
-            if tx.is_ignored or (tx.category and tx.category.is_ignored):
-                continue
-            amount = _signed_transaction_amount(tx)
-            if tx.account and tx.account.connection_id and tx.date <= today:
-                continue
-            converted, _ = await convert(
-                session,
-                Decimal(str(amount)),
-                tx.account.currency if tx.account else tx.currency,
-                primary_currency,
-            )
-            proj_deltas[tx.date.day] = proj_deltas.get(tx.date.day, 0) + float(converted)
-
-        projections = await _get_recurring_projections(
-            session, workspace_id, proj_start, month_end, account_ids
-        )
-        for proj in projections:
-            day = proj["date"].day
-            proj_converted, _ = await convert(
-                session, Decimal(str(proj["amount"])), proj["currency"], primary_currency,
-            )
-            amount = float(proj_converted)
-            signed = amount if proj["type"] == "credit" else -amount
-            proj_deltas[day] = proj_deltas.get(day, 0) + signed
-
-    # Build current month daily balances
-    current_daily = []
-    balance = current_start
+    current_daily, forecast_daily = [], []
     for day in range(1, days_in_month + 1):
-        balance += current_deltas.get(day, 0) + proj_deltas.get(day, 0)
-        current_daily.append(DailyBalance(
-            day=day,
-            balance=round(balance, 2) if day <= cutoff_day else None,
-        ))
-
-    # Build previous month daily balances
-    prev_daily = []
-    balance = prev_start
-    for day in range(1, prev_days_in_month + 1):
-        balance += prev_deltas.get(day, 0)
-        prev_daily.append(DailyBalance(day=day, balance=round(balance, 2)))
-
-    return BalanceHistory(current=current_daily, previous=prev_daily)
+        d = month_start + timedelta(days=day - 1)
+        current_daily.append(DailyBalance(day=day, balance=at(d) if d <= today else None))
+        forecast_daily.append(DailyBalance(day=day, balance=at(d) if d >= today else None))
+    prev_daily = [
+        DailyBalance(day=day, balance=at(prev_month_start + timedelta(days=day - 1)))
+        for day in range(1, prev_days_in_month + 1)
+    ] if has_actuals else []
+    return BalanceHistory(
+        current=current_daily,
+        previous=prev_daily,
+        forecast=forecast_daily,
+        start_balance=at(month_start - timedelta(days=1)),
+    )

@@ -211,7 +211,7 @@ async def test_connecting_a_bank_succeeds_with_the_name_already_used_elsewhere(
 
 @pytest.mark.asyncio
 async def test_connecting_the_bank_succeeds_on_the_callback_itself(
-    session: AsyncSession, test_user, test_workspace
+    pluggy_credential, session: AsyncSession, test_user, test_workspace
 ):
     """The endpoint the report died on: `POST /api/connections/oauth/callback`
     imports the first batch of transactions inline, so the connection is

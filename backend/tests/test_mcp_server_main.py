@@ -285,6 +285,12 @@ async def test_mcp_list_rules_returns_advanced_rule_definition(
                 "actions": rule.actions,
                 "priority": 7,
                 "is_active": True,
+                # Rules v2 (RFC toledo-features §5.3)
+                "scope_account_kind": None,
+                "scope_account_id": None,
+                "is_builtin": False,
+                "builtin_key": None,
+                "errors": [],
             }
         ],
         "total": 1,
@@ -351,6 +357,8 @@ async def test_mcp_propose_create_rule_preserves_advanced_draft_without_writing(
         **arguments,
         "is_active": True,
         "overwrite_existing_categories": False,
+        "scope_account_kind": None,
+        "scope_account_id": None,
     }
     assert proposal["preview"]["will_apply"] is False
     after = (await session.execute(select(func.count()).select_from(Rule))).scalar_one()

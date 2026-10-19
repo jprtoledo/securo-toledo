@@ -1,5 +1,5 @@
 import uuid
-from datetime import date as _Date
+from datetime import date as _Date, datetime
 from decimal import Decimal
 from typing import Literal, Optional
 
@@ -201,6 +201,47 @@ class TransactionRead(TransactionBase):
     parent_owner_name: Optional[str] = None
     is_ignored: bool = False
     exclude_from_pnl: bool = False
+    # Sync state (RFC toledo-features §4.6–§4.7).
+    ignored_reason: Optional[str] = None
+    provider_removed_at: Optional[datetime] = None
+    duplicate_of_id: Optional[uuid.UUID] = None
+    duplicate_override: bool = False
+    sync_locked: bool = False
+    # Read-only provider information (§4.3).
+    provider_id: Optional[str] = None
+    operation_type: Optional[str] = None
+    card_number: Optional[str] = None
+    merchant_name: Optional[str] = None
+    merchant_mcc: Optional[str] = None
+    provider_category: Optional[str] = None
+    provider_bill_external_id: Optional[str] = None
+    payment_type: Optional[str] = None
+    provider_description_raw: Optional[str] = None
+    # Explanations (RFC §5.3, §6.2): why the category, the card line kind and
+    # the effective date are what they are.
+    category_source: Optional[str] = None
+    category_rule_id: Optional[uuid.UUID] = None
+    card_line_kind: Optional[str] = None
+    card_line_kind_source: Optional[str] = None
+    card_line_kind_reason: Optional[str] = None
+    effective_date: Optional[_Date] = None
+    effective_date_source: Optional[str] = None
+    # Installment plan (RFC §7): the plan, how the parcel is linked
+    # (auto | conflict | manual), why it conflicts, and the user's decision.
+    installment_plan_id: Optional[uuid.UUID] = None
+    installment_link: Optional[str] = None
+    installment_issue: Optional[dict] = None
+    installment_plan_manual_id: Optional[uuid.UUID] = None
+    # Recurrences v2 (RFC §8.2): the period fulfilled, the link and why it
+    # conflicts, plus the user's decisions.
+    recurring_period: Optional[_Date] = None
+    recurring_link: Optional[str] = None
+    recurring_issue: Optional[dict] = None
+    recurring_companion: bool = False
+    recurring_manual_id: Optional[uuid.UUID] = None
+    recurring_manual_none: bool = False
+    recurring_manual_excluded: bool = False
+    recurring_rejected_ids: Optional[list[uuid.UUID]] = None
 
     @model_validator(mode="after")
     def reflect_ignored_category(self):
@@ -209,6 +250,10 @@ class TransactionRead(TransactionBase):
         return self
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class SyncLockRequest(BaseModel):
+    locked: bool
 
 
 class BulkCategorizeRequest(BaseModel):

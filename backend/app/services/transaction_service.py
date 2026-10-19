@@ -132,6 +132,8 @@ async def get_transactions(
     include_summary: bool = False,
     user_pnl_only: bool = False,
     exclude_ignored: bool = False,
+    sync_state: Optional[str] = None,
+    statement_month: Optional[date] = None,
 ) -> tuple[list[Transaction], int, Optional[dict]]:
     """List transactions for a workspace.
 
@@ -146,7 +148,9 @@ async def get_transactions(
     # point of the override (issue #92, LucasFidelis suggestion). Shared
     # with the dashboard/report/budget aggregations so a transaction lands
     # in the same month everywhere (issue #232).
-    date_col = reporting_date_col(accounting_mode or "cash")
+    # A list is a ledger: filtered by the row's own dates, not by the
+    # statement month the totals use.
+    date_col = reporting_date_col(accounting_mode or "cash", reference_months=False)
 
     # Group-scope visibility: when the caller filters by a group they
     # have access to (owner or linked member), bypass the user-owns-it
@@ -271,6 +275,20 @@ async def get_transactions(
         # filtered set, so the totals a hidden list shows stay the totals of
         # what it is showing.
         base_query = base_query.where(is_not_ignored())
+    if statement_month is not None:
+        # Rows of one card statement (RFC toledo-features §6.4): the due
+        # month of their effective date, the bucketing the statements use.
+        from app.services.recompute.months import add_months, month_of
+
+        start = month_of(statement_month)
+        statement_date = func.coalesce(Transaction.effective_date, Transaction.date)
+        base_query = base_query.where(
+            statement_date >= start, statement_date < add_months(start, 1),
+        )
+    if sync_state == "removed":
+        base_query = base_query.where(Transaction.provider_removed_at.is_not(None))
+    elif sync_state == "duplicate":
+        base_query = base_query.where(Transaction.duplicate_of_id.is_not(None))
     if txn_type == "transfer":
         # Not a value of the `type` column: a transfer is still stored as a
         # credit or a debit, so this narrows to the transfer family instead.
@@ -727,6 +745,8 @@ async def create_transaction(
         workspace_id=workspace_id,
         account_id=data.account_id,
         category_id=data.category_id,  # use provided category if given
+        # The user's own choice is sticky: rules never override it (RFC §5.3).
+        category_source="manual" if data.category_id else None,
         payee_id=data.payee_id,
         external_id=data.external_id,
         description=data.description,
@@ -836,6 +856,7 @@ async def create_installment_series(
             workspace_id=workspace_id,
             account_id=base.account_id,
             category_id=base.category_id,
+            category_source="manual" if base.category_id else None,
             payee_id=base.payee_id,
             description=base.description,
             amount=base.amount,
@@ -873,6 +894,10 @@ async def create_installment_series(
         if base.splits is not None:
             await split_service.replace_splits(session, tx, base.splits, user_id)
 
+    # The series is exposed as an installment plan of its own (RFC §7.2).
+    from app.services.recompute_service import recompute_account
+
+    await recompute_account(session, base.account_id)
     await session.commit()
     for tx in created:
         await session.refresh(tx, ["category", "splits"])
@@ -1435,6 +1460,14 @@ async def _apply_update_to_row(
     for key, value in update_data.items():
         if key in fx_keys:
             continue
+        if key == "is_ignored":
+            set_ignored_by_user(tx, bool(value))
+            continue
+        if key == "category_id" and value != tx.category_id:
+            # A category the user picks is sticky; clearing it hands the row
+            # back to rules and the provider mapping (RFC toledo-features §5.3).
+            tx.category_source = "manual" if value is not None else None
+            tx.category_rule_id = None
         setattr(tx, key, value)
 
     restamp_fields = {"amount", "currency", "date"}
@@ -1478,6 +1511,8 @@ async def _apply_update_to_row(
         if paired_tx:
             if should_cascade_category:
                 paired_tx.category_id = tx.category_id
+                paired_tx.category_source = tx.category_source
+                paired_tx.category_rule_id = None
             # When the user typed both amounts, neither is a conversion of the
             # other: correcting one leg leaves the amount that actually landed
             # on the other account untouched. Re-converting here would throw
@@ -1624,6 +1659,12 @@ async def update_transaction(
             row_splits,
         )
 
+    if "category_id" in update_data:
+        from app.services import installment_plan_service
+
+        for row in rows:
+            await installment_plan_service.record_category_choice(session, row)
+
     # A changed parcel amount makes the stored series total stale, whatever
     # the scope was: "this" reprices one parcel, "future"/"all" reprice
     # several. Recompute from the rows themselves so the two always agree.
@@ -1649,7 +1690,11 @@ async def bulk_update_category(
             Transaction.id.in_(transaction_ids),
             Transaction.workspace_id == workspace_id,
         )
-        .values(category_id=category_id)
+        .values(
+            category_id=category_id,
+            category_source="manual" if category_id is not None else None,
+            category_rule_id=None,
+        )
     )
     await session.commit()
     return cast(CursorResult, result).rowcount
@@ -1841,6 +1886,33 @@ async def bulk_add_to_group(
     return {"updated": updated, "skipped": skipped}
 
 
+def set_ignored_by_user(tx: Transaction, ignored: bool) -> None:
+    """The user's ignore/unignore (RFC toledo-features §4.7).
+
+    Ignoring records the reason 'user', which no automatic reason ever
+    overrides. Unignoring a row the system ignored turns it into a
+    protected "keep": a duplicate gets ``duplicate_override`` so recompute
+    stops re-flagging it; a row removed by the bank keeps its
+    ``provider_removed_at`` (shown as a badge) and is not re-removed.
+    """
+    if ignored:
+        if not tx.is_ignored:
+            tx.is_ignored = True
+            tx.ignored_reason = "user"
+        return
+    if tx.ignored_reason == "duplicate":
+        tx.duplicate_override = True
+        tx.duplicate_of_id = None
+    tx.is_ignored = False
+    tx.ignored_reason = None
+
+
+async def _recompute_after_decision(session: AsyncSession, account_id: uuid.UUID) -> None:
+    from app.services.recompute_service import recompute_account
+
+    await recompute_account(session, account_id)
+
+
 async def toggle_ignore_transaction(
     session: AsyncSession,
     transaction_id: uuid.UUID,
@@ -1853,10 +1925,112 @@ async def toggle_ignore_transaction(
     transaction = await get_transaction(session, transaction_id, workspace_id)
     if not transaction:
         return None
-    transaction.is_ignored = not transaction.is_ignored
+    was_automatic = transaction.ignored_reason in ("duplicate", "provider_removed")
+    set_ignored_by_user(transaction, not transaction.is_ignored)
+    if was_automatic:
+        await _recompute_after_decision(session, transaction.account_id)
+    await _reconcile_opening_balance(session, transaction.account_id)
     await session.commit()
     await session.refresh(transaction)
     return transaction
+
+
+async def _reconcile_opening_balance(session: AsyncSession, account_id: uuid.UUID) -> None:
+    """Connected accounts keep SUM(txs) = provider balance; an ignore change
+    moves the sum, so the synthetic opening row follows."""
+    from app.services.account_service import sync_opening_balance_for_connected_account
+
+    account = await session.get(Account, account_id)
+    if account is not None and account.connection_id is not None and not account.is_closed:
+        await session.flush()
+        await sync_opening_balance_for_connected_account(session, account)
+
+
+async def mark_not_duplicate(
+    session: AsyncSession,
+    transaction_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+) -> Optional[Transaction]:
+    """"Not a duplicate" (AC-2.11): the row counts again and recompute
+    never flags it again."""
+    transaction = await get_transaction(session, transaction_id, workspace_id)
+    if not transaction:
+        return None
+    transaction.duplicate_override = True
+    transaction.duplicate_of_id = None
+    if transaction.ignored_reason == "duplicate":
+        transaction.is_ignored = False
+        transaction.ignored_reason = None
+    await _recompute_after_decision(session, transaction.account_id)
+    await _reconcile_opening_balance(session, transaction.account_id)
+    await session.commit()
+    await session.refresh(transaction)
+    return transaction
+
+
+async def set_sync_lock(
+    session: AsyncSession,
+    transaction_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    locked: bool,
+) -> Optional[Transaction]:
+    """"Don't update from the bank" (AC-2.3). Unlocking applies the latest
+    payload the bank sent while the row was locked, immediately."""
+    transaction = await get_transaction(session, transaction_id, workspace_id)
+    if not transaction:
+        return None
+    if transaction.sync_locked == locked:
+        return transaction
+    transaction.sync_locked = locked
+    if not locked:
+        await _apply_stored_payload(session, transaction, user_id)
+        await _recompute_after_decision(session, transaction.account_id)
+        await _reconcile_opening_balance(session, transaction.account_id)
+    await session.commit()
+    await session.refresh(transaction)
+    return transaction
+
+
+async def _apply_stored_payload(
+    session: AsyncSession, transaction: Transaction, user_id: uuid.UUID
+) -> None:
+    """Replay the stored provider payload on the visible fields (Pluggy)."""
+    if not isinstance(transaction.raw_data, dict) or transaction.source != "sync":
+        return
+    account = await session.get(Account, transaction.account_id)
+    if account is None or account.connection_id is None:
+        return
+    connection = await session.get(BankConnection, account.connection_id)
+    if connection is None or connection.provider != "pluggy":
+        return
+    from app.models.credit_card_bill import CreditCardBill
+    from app.providers.pluggy import PluggyProvider
+    from app.services.pluggy_sync import provider_update
+
+    try:
+        data = PluggyProvider()._build_transaction_data(transaction.raw_data)
+    except (KeyError, TypeError, ValueError):
+        return
+    bill = None
+    if data.bill_external_id:
+        bill = (
+            await session.execute(
+                select(CreditCardBill).where(
+                    CreditCardBill.account_id == account.id,
+                    CreditCardBill.external_id == data.bill_external_id,
+                )
+            )
+        ).scalar_one_or_none()
+    outcome = provider_update.update_existing_row(
+        transaction, data, currency=data.currency or transaction.currency, bill=bill
+    )
+    if outcome.money_changed:
+        await stamp_primary_amount(session, user_id, transaction)
+    if outcome.placement_changed or outcome.money_changed:
+        apply_effective_date(
+            transaction, account, bill_due_date=bill.due_date if bill else None
+        )
 
 
 async def unlink_recurring_transaction(

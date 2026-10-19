@@ -64,7 +64,7 @@ import { useAuth } from '@/contexts/auth-context'
 import { useWorkspace } from '@/contexts/workspace-context'
 import { useCollectionFilter } from '@/contexts/collection-filter-context'
 import { formatCurrency } from '@/lib/format'
-import { shouldShowPendingBadge } from '@/lib/transaction-status'
+import { shouldShowPendingBadge, statusFilterParams } from '@/lib/transaction-status'
 
 type TransactionUpdatePayload = TransactionEditPayload & {
   apply_to_transfer_pair?: boolean
@@ -392,7 +392,7 @@ export default function TransactionsPage() {
         payee_id: filterPayee || undefined,
         group_id: filterGroupId || undefined,
         type: filterType || undefined,
-        status: filterStatus || undefined,
+        ...statusFilterParams(filterStatus),
         uncategorized: filterUncategorized ? true : undefined,
         from: filterFrom || undefined,
         to: filterTo || undefined,
@@ -947,7 +947,7 @@ export default function TransactionsPage() {
           category_ids: filterCategoryIds.length > 0 ? filterCategoryIds : undefined,
           payee_id: filterPayee || undefined,
           type: filterType || undefined,
-          status: filterStatus || undefined,
+          ...statusFilterParams(filterStatus),
           uncategorized: filterUncategorized ? true : undefined,
           from: filterFrom || undefined,
           to: filterTo || undefined,
@@ -1174,6 +1174,9 @@ export default function TransactionsPage() {
                   : undefined}
               >
                 {tx.installment_number}/{tx.total_installments}
+                {tx.installment_link === 'conflict' && (
+                  <span className="ml-0.5 text-rose-600" title={t('installments.conflictBadge')}>!</span>
+                )}
               </span>
             )}
             {shouldShowPendingBadge(tx) && (

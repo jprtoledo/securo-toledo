@@ -3,7 +3,7 @@ from datetime import date as _date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import Date, DateTime, ForeignKey, JSON, Numeric, String, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, JSON, Numeric, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -40,6 +40,13 @@ class CreditCardBill(Base):
     currency: Mapped[str] = mapped_column(String(3), default="BRL")
     minimum_payment: Mapped[Optional[Decimal]] = mapped_column(Numeric(precision=15, scale=2), nullable=True)
     raw_data: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # Promoted from the provider payload (RFC toledo-features §4.3).
+    closing_date: Mapped[Optional[_date]] = mapped_column(Date, nullable=True)
+    allows_installments: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    payments: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    finance_charges_total: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(precision=15, scale=2), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

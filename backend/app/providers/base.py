@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal, Optional
 
@@ -78,6 +78,13 @@ class AccountData:
     institution_external_id: Optional[str] = None
     institution_name: Optional[str] = None
     institution_logo_url: Optional[str] = None
+    # Provider snapshot promoted to columns (RFC toledo-features §4.3).
+    available_credit_limit: Optional[Decimal] = None
+    balance_close_date: Optional[date] = None
+    balance_due_date: Optional[date] = None
+    overdraft_limit: Optional[Decimal] = None
+    overdraft_used: Optional[Decimal] = None
+    card_holder_type: Optional[str] = None
 
 
 @dataclass
@@ -101,6 +108,25 @@ class TransactionData:
     # Provider-side identifier of the bill this transaction belongs to.
     # Resolved to a credit_card_bills.id FK at sync time (issue #92).
     bill_external_id: Optional[str] = None
+    # Provider-owned fields promoted to columns (RFC toledo-features §4.3).
+    # Only Pluggy fills them; every other provider leaves the defaults.
+    provider_id: Optional[str] = None
+    provider_code: Optional[str] = None
+    provider_created_at: Optional[datetime] = None
+    provider_updated_at: Optional[datetime] = None
+    description_raw: Optional[str] = None
+    operation_type: Optional[str] = None
+    provider_category_id: Optional[str] = None
+    merchant_name: Optional[str] = None
+    merchant_cnpj: Optional[str] = None
+    merchant_mcc: Optional[str] = None
+    card_number: Optional[str] = None
+    payment_type: Optional[str] = None
+    transaction_at: Optional[datetime] = None
+    bill_forecast_month: Optional[date] = None
+    bill_post_date: Optional[date] = None
+    balance_after: Optional[Decimal] = None
+    payment_data: Optional[dict] = None
 
 
 @dataclass
@@ -136,6 +162,10 @@ class BillData:
     currency: str = "BRL"
     minimum_payment: Optional[Decimal] = None
     raw_data: Optional[dict] = None
+    closing_date: Optional[date] = None
+    allows_installments: Optional[bool] = None
+    payments: Optional[list] = None
+    finance_charges_total: Optional[Decimal] = None
 
 
 @dataclass

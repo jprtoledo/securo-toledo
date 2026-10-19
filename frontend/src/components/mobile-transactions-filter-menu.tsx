@@ -490,7 +490,13 @@ function MobileFilterDetail({
     return <MobileSelectionView options={options} selectedValue={menu.type} onChange={menu.onTypeChange} />
   }
   if (menu.view === 'status') {
-    const options = [allOption, { value: 'pending', label: t('transactions.statusPending') }, { value: 'posted', label: t('transactions.statusPosted') }]
+    const options = [
+      allOption,
+      { value: 'pending', label: t('transactions.statusPending') },
+      { value: 'posted', label: t('transactions.statusPosted') },
+      { value: 'removed', label: t('transactions.sync.filterRemoved') },
+      { value: 'duplicate', label: t('transactions.sync.filterDuplicates') },
+    ]
     return <MobileSelectionView options={options} selectedValue={menu.status} onChange={menu.onStatusChange} />
   }
   if (menu.view === 'ignored') {

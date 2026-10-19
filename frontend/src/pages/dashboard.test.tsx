@@ -136,3 +136,22 @@ describe('Dashboard net worth breakdown', () => {
     expect(cardRow).toHaveTextContent(formatCurrency(-500, 'USD', 'en-US'))
   })
 })
+
+describe('Dashboard balance evolution', () => {
+  it('draws the forecast after today and measures the period to its forecast close', async () => {
+    api.dashboard.balanceHistory.mockResolvedValue({
+      current: [{ day: 1, balance: 1100 }, { day: 2, balance: 1050 }, { day: 3, balance: null }],
+      forecast: [{ day: 1, balance: null }, { day: 2, balance: 1050 }, { day: 3, balance: 1200 }],
+      previous: [{ day: 1, balance: 900 }, { day: 2, balance: 950 }, { day: 3, balance: 990 }],
+      start_balance: 1000,
+    })
+    renderWithProviders(
+      <TooltipProvider delayDuration={0}>
+        <DashboardPage />
+      </TooltipProvider>,
+    )
+    expect(await screen.findByTestId('balance-forecast-legend')).toHaveTextContent('Forecast')
+    // From the 1,000 the month opened with to the 1,200 it is forecast to close at.
+    expect(screen.getByText('Period change').parentElement).toHaveTextContent('+$200.00')
+  })
+})

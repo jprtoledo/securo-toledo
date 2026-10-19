@@ -894,7 +894,8 @@
     "fxRateUsed": "Kurz: {{rate}}",
     "refreshRates": "Obnoviť kurzy",
     "ratesRefreshed": "Kurzy aktualizované",
-    "ratesError": "Kurzy sa nepodarilo aktualizovať"
+    "ratesError": "Kurzy sa nepodarilo aktualizovať",
+    "balanceForecastLegend": "Forecast"
   },
   "transactions": {
     "title": "Transakcie",
@@ -1200,7 +1201,43 @@
     "invoiceBadgeTooltip": "Táto transakcia vyrovnáva faktúru. Otvorte ju.",
     "suggestionBadge": "Otázka",
     "suggestionBadgeTooltip": "Platba môže uhradiť túto faktúru. Otvorte front a odpovedzte.",
-    "clearGroupFilter": "Zrušiť filter skupiny"
+    "clearGroupFilter": "Zrušiť filter skupiny",
+    "sync": {
+      "filterRemoved": "Removed by the bank",
+      "filterDuplicates": "Duplicates",
+      "removedByBank": "Removed by the bank on {{date}}",
+      "removedHint": "It no longer counts in balances or reports. Unignore it to keep it anyway.",
+      "removedKept": "You chose to keep it: it still counts.",
+      "duplicateOf": "Duplicate of “{{description}}” ({{date}}) — it does not count.",
+      "duplicateOfUnknown": "Duplicate of another transaction — it does not count.",
+      "notDuplicate": "Not a duplicate",
+      "notDuplicateDone": "Marked as not a duplicate",
+      "lock": "Don't update from the bank",
+      "lockHint": "Keep amount, date, description and status as they are now, even if the bank changes them.",
+      "locked": "Bank updates paused for this transaction",
+      "unlocked": "Bank updates resumed",
+      "providerDetails": "Bank details",
+      "operationType": "Operation type",
+      "cardNumber": "Card",
+      "merchant": "Merchant",
+      "mcc": "MCC",
+      "providerCategory": "Bank category",
+      "paymentType": "Payment type",
+      "billId": "Bill id",
+      "rawDescription": "Original text",
+      "placedIn": "Counts in the bill due {{date}}:",
+      "placedBy": {
+        "manual": "you moved it there.",
+        "bill": "the bank put it on that bill.",
+        "forecast": "the bank's bill forecast.",
+        "post_date": "the bank's posting date.",
+        "cycle": "its date in the billing cycle.",
+        "tx_date": "its own date."
+      },
+      "cardKindIs": "Statement line: {{kind}}.",
+      "carriedOver": "(repeated from the previous bill)",
+      "byRule": "(by a rule)"
+    }
   },
   "accounts": {
     "title": "Účty",
@@ -1368,7 +1405,71 @@
       "active": "Aktívne",
       "error": "Chyba",
       "expired": "Vypršané"
-    }
+    },
+    "statements": {
+      "title": "Statements",
+      "empty": "No statements yet.",
+      "howPlaced": "How we place open-bill purchases",
+      "cycleDerived": "Closes on day {{closing}}, due on day {{due}} (learned from the bills).",
+      "cycleManual": "Closes on day {{closing}}, due on day {{due}} (set by you).",
+      "cycleUnknown": "The billing cycle is not known yet.",
+      "truthSamples_one": "Measured on {{count}} purchase already on a bill.",
+      "truthSamples_other": "Measured on {{count}} purchases already on a bill.",
+      "forecastOffset_one": "The bank's forecast lands {{count}} month off; corrected.",
+      "forecastOffset_other": "The bank's forecast lands {{count}} months off; corrected.",
+      "method": {
+        "forecast": "Bank's bill forecast",
+        "post_date": "Bank's posting date",
+        "cycle": "Purchase date in the cycle"
+      },
+      "state": {
+        "closed": "Closed",
+        "closed_estimated": "Closed (estimated)",
+        "open": "Open",
+        "future": "Future"
+      },
+      "status": {
+        "paid": "Paid on {{date}}",
+        "due": "Due",
+        "overdue": "Overdue",
+        "nothing_due": "Nothing due",
+        "not_closed": "Not closed yet",
+        "unknown": "Payment unknown"
+      },
+      "closing": "Closes",
+      "due": "Due",
+      "spent": "Spent",
+      "prepaid": "Prepaid",
+      "paid": "Paid",
+      "minimum": "Minimum",
+      "projectedInstallments_one": "{{count}} installment to come",
+      "projectedInstallments_other": "{{count}} installments to come",
+      "projectedRecurring_one": "{{count}} recurring charge expected",
+      "projectedRecurring_other": "{{count}} recurring charges expected",
+      "reconciliationDiff": "Differs from the bank's total by {{diff}}",
+      "beforeHistory": "Before the first synced transaction: only the bank's total is known.",
+      "firstHistory": "First month with transactions: the start of the cycle may be missing.",
+      "estimatedNote": "≈ estimated total · * estimated date"
+    },
+    "forecast": {
+      "committed": "Posted + installments",
+      "withRecurring": "With expected recurring charges",
+      "range": "Period",
+      "today": "Today",
+      "posted": "Posted",
+      "installments": "Upcoming installments"
+    },
+    "limitUsage": {
+      "aria": "{{used}} of {{limit}} used",
+      "unexplained": "Not itemized",
+      "unexplainedHint": "Used limit reported by the bank beyond the statements Securo can itemize (e.g. installments of purchases older than the synced history).",
+      "selected": "{{month}}: {{amount}}"
+    },
+    "realTag": "Real",
+    "forecastLabel": "Forecast",
+    "forecastBreakdown": "Upcoming installments {{installments}} · Expected recurring {{recurring}}",
+    "forecastIn": "Forecast {{month}}:",
+    "availableForecastHint": "Available credit expected while this bill is open: the earlier bills paid, plus the recurring charges expected on it."
   },
   "connections": {
     "settings": "Nastavenia prepojenia",
@@ -1386,7 +1487,12 @@
     "syncAssetsHint": "Ak je vypnuté, prepojenie synchronizuje účty a transakcie, ale investičné pozície od poskytovateľa nechá nedotknuté.",
     "initialSyncSettings": "Možnosti synchronizácie",
     "initialSyncSettingsDesc": "Vyber, čo má Securo importovať, skôr než otvoríš konektor.",
-    "continueToConnector": "Pokračovať ku konektoru"
+    "continueToConnector": "Pokračovať ku konektoru",
+    "pluggyApplication": "Pluggy application",
+    "pluggyApplicationHint": "Choose which Pluggy application this bank connection belongs to.",
+    "pluggyApplicationNone": "Not bound to an application",
+    "providerStatus": "Pluggy status: {{status}} ({{execution}})",
+    "consentExpires": "Bank consent expires on {{date}}"
   },
   "settings": {
     "rules": "Pravidlá",
@@ -1532,7 +1638,84 @@
     "autoGenerate": "Generovať transakcie automaticky",
     "autoGenerateHelp": "Vytvorí transakciu vždy, keď je táto platba splatná. Vypni, ak chceš počkať na skutočnú platbu (napr. zo synchronizácie banky) a dovtedy ju zobrazovať len ako nadchádzajúcu.",
     "fxEstimate": "Odhad podľa posledného výmenného kurzu ({{rate}}). Konečná suma sa môže zmeniť.",
-    "confirmDeleteDescription": "Opakovaná definícia „{{description}}“ bude natrvalo vymazaná. Existujúce transakcie zostanú, ale stratia prepojenie na opakovanie. Túto akciu nie je možné vrátiť späť."
+    "confirmDeleteDescription": "Opakovaná definícia „{{description}}“ bude natrvalo vymazaná. Existujúce transakcie zostanú, ale stratia prepojenie na opakovanie. Túto akciu nie je možné vrátiť späť.",
+    "weekly_billed_monthly": "Weekly, billed monthly",
+    "decisionSaved": "Recurring link updated",
+    "linkedUnknown": "Recurring charge",
+    "link": {
+      "auto": "Linked automatically",
+      "conflict": "Needs review",
+      "manual": "Linked by you"
+    },
+    "companion": "Tax on this charge (IOF)",
+    "markedNotRecurring": "Marked as not a recurring charge",
+    "notLinked": "Not linked to a recurring charge",
+    "issue": {
+      "amount_changed": "Charged {{charged}}, expected {{expected}}: the amount changed.",
+      "double_charge": "Another charge already covers this period: possible double charge."
+    },
+    "confirmAmount": "Confirm new amount",
+    "confirmHint": "The new amount becomes the expected amount from now on",
+    "accept": "Accept",
+    "acceptHint": "Keep it linked without changing the expected amount",
+    "reject": "Not this recurrence",
+    "undoDecision": "Undo",
+    "makeRecurring": "Make recurring",
+    "notRecurring": "Not recurring",
+    "linkTo": "Link to…",
+    "slot": {
+      "posted": "Posted",
+      "conflict": "Needs review",
+      "expected": "Expected",
+      "late": "Late",
+      "missed": "Missed",
+      "skipped": "Won't happen"
+    },
+    "linkedCount_one": "{{count}} charge linked",
+    "linkedCount_other": "{{count}} charges linked",
+    "ended": "Recurring charge ended",
+    "conflicts_one": "{{count}} to review",
+    "conflicts_other": "{{count}} to review",
+    "suggestEnd_one": "Missed the last period. Has it ended?",
+    "suggestEnd_other": "Missed the last {{count}} periods. Has it ended?",
+    "end": "End it",
+    "suggestions": {
+      "title": "Suggested recurring charges",
+      "about": "about",
+      "seen_one": "seen in {{count}} period, last on {{last}}",
+      "seen_other": "seen in {{count}} periods, last on {{last}}",
+      "create": "Create",
+      "dismiss": "Dismiss",
+      "empty": "No suggestions for this account"
+    },
+    "amountPerWeek": "Amount per week",
+    "billingDay": "Billing day",
+    "billingWeekday": "Weekday of the service",
+    "weekCountBasis": "Weeks counted in",
+    "basisPreviousMonth": "The previous month",
+    "basisSameMonth": "The billing month",
+    "weeklyPreview": "{{month}}: {{units}} × {{amount}} = {{total}}",
+    "amountMode": "Amount",
+    "amountFixed": "Fixed",
+    "amountVariable": "Variable",
+    "tolerance": "Tolerance (%)",
+    "dayWindow": "Day window (± days)",
+    "dayWindowAuto": "Automatic",
+    "matchCondition": "Which charges belong to it",
+    "matchConditionHint": "Conditions in the rules language. Leave empty to match by description and amount.",
+    "skip": {
+      "action": "Won't happen",
+      "undo": "It will happen",
+      "hint": "Reports count every occurrence still to come. Mark this one if it did not or will not happen.",
+      "undoHint": "Marked as not happening: reports leave it out.",
+      "done": "Occurrence left out of the reports",
+      "undone": "Occurrence counted again"
+    },
+    "extraAccounts": "Can also be paid from",
+    "extraAccountsHint": "Each period is paid in full by one of these accounts or the one above. The forecast stays on the account above.",
+    "accountsCount_one": "{{count}} account",
+    "accountsCount_other": "{{count}} accounts",
+    "paidFrom": "paid from {{account}}"
   },
   "rules": {
     "searchPlaceholder": "Hľadať pravidlá...",
@@ -1665,6 +1848,76 @@
       "rules": "Pravidlá",
       "queue": "Čaká na vás",
       "history": "História"
+    },
+    "fieldDescriptionKey": "Description (letters only)",
+    "fieldOriginalDescription": "Original description",
+    "fieldProviderDescriptionRaw": "Bank's raw description",
+    "fieldMerchant": "Merchant",
+    "fieldSignedAmount": "Signed amount (− out, + in)",
+    "fieldCurrency": "Currency",
+    "fieldOperationType": "Operation type (bank)",
+    "fieldProviderCategory": "Bank category",
+    "fieldAccountKind": "Account kind",
+    "fieldCardNumber": "Card number (last digits)",
+    "fieldInstallmentNumber": "Installment number",
+    "fieldTotalInstallments": "Total installments",
+    "fieldPaymentType": "Payment type",
+    "paymentSingle": "Single payment",
+    "paymentInstallment": "Installments",
+    "opNotRegex": "does not match regex",
+    "opIn": "is one of",
+    "opNotIn": "is none of",
+    "opIsEmpty": "is empty",
+    "opIsNotEmpty": "is not empty",
+    "notOp": "NOT",
+    "notGroup": "None of this (NOT)",
+    "removeNot": "Remove NOT",
+    "negateHint": "Negate: match when this does not",
+    "listValuePlaceholder": "Values separated by commas",
+    "field": "Field",
+    "operator": "Operator",
+    "tooDeep": "Conditions can be nested at most {{max}} levels.",
+    "scope": "Applies to",
+    "scopeAll": "Every account",
+    "scopeBank": "Bank accounts",
+    "scopeCard": "Credit cards",
+    "scopeOneAccount": "One account",
+    "scopeHint": "Credit-card-only fields and actions appear when the rule is limited to credit cards.",
+    "clearCategory": "Clear category",
+    "clearCategoryHint": "Removes the category",
+    "setCardLineKind": "Card line kind",
+    "stripInstallmentMarker": "Strip installment marker",
+    "stripPatternPlaceholder": "Regular expression (only for grouping installments)",
+    "cardKind": {
+      "purchase": "Purchase",
+      "credit": "Credit",
+      "payment": "Bill payment",
+      "previous_balance": "Previous balance"
+    },
+    "overwriteManualChoices": "Also override categories I chose by hand",
+    "builtin": "Built-in",
+    "skippedBecause": "Skipped:",
+    "restoreDefaults": "Restore defaults",
+    "restoreDefaultsHint": "Recreate deleted built-in rules and undo edits to them",
+    "defaultsRestored": "Built-in rules restored",
+    "errors": {
+      "invalid_condition": "invalid condition",
+      "invalid_action": "invalid action",
+      "invalid_scope": "invalid scope",
+      "invalid_group_op": "a group must use AND or OR",
+      "empty_group": "empty group",
+      "too_deep": "nested too deep (max {{max}})",
+      "field_not_in_scope": "the field \"{{field}}\" only exists on credit cards",
+      "action_not_in_scope": "this action only applies to credit cards",
+      "op_not_for_field": "operator not valid for \"{{field}}\"",
+      "unexpected_value": "\"{{op}}\" takes no value",
+      "missing_value": "a value is missing for \"{{field}}\"",
+      "invalid_value": "invalid value for \"{{field}}\"",
+      "invalid_regex": "invalid regular expression",
+      "invalid_card_kind": "invalid card line kind",
+      "blank_description": "the description is blank",
+      "long_description": "the description is too long",
+      "category_missing": "its category no longer exists"
     }
   },
   "categories": {
@@ -2105,7 +2358,13 @@
     "range30d": "30D",
     "customRange": "Vlastný rozsah",
     "pickCustomRange": "Vyberte dátum začiatku a konca",
-    "loadError": "Nepodarilo sa načítať prehľad"
+    "loadError": "Nepodarilo sa načítať prehľad",
+    "cardBills": "{{name}} bills",
+    "cashFlowScope": "Money in your accounts · cards leave on each bill's due date",
+    "referenceDate": "Reference date",
+    "period": "Period",
+    "periodBefore": "Months before",
+    "periodAfter": "Months after"
   },
   "payees": {
     "noPayeeFound": "Príjemca sa nenašiel.",
@@ -2524,6 +2783,29 @@
       "timezoneServerDefault": "Predvolené servera ({{zone}})",
       "timezoneSavedInvalid": "Uložená hodnota {{value}} nie je časové pásmo, ktoré tento server pozná. Kým sa nezmení, používa sa {{zone}}.",
       "updated": "Nastavenie aktualizované"
+    },
+    "pluggy": {
+      "title": "Pluggy applications",
+      "subtitle": "Client ID and secret of each Pluggy application (dashboard.pluggy.ai). Every Pluggy connection uses the application it was created with.",
+      "add": "Add application",
+      "addTitle": "Add Pluggy application",
+      "editTitle": "Edit Pluggy application",
+      "dialogDesc": "The keys are stored encrypted and are never shown again. They are not checked now: a wrong key shows up on the first sync.",
+      "name": "Name",
+      "clientId": "Client ID",
+      "clientSecret": "Client secret",
+      "keepBlank": "Leave blank to keep the current value.",
+      "connections_one": "{{count}} connection",
+      "connections_other": "{{count}} connections",
+      "lastError": "Last error: {{error}}",
+      "empty": "No Pluggy application yet. Add one to connect Brazilian banks.",
+      "notConfigured": "Pluggy is not configured.",
+      "saved": "Pluggy application saved",
+      "deleted": "Pluggy application deleted",
+      "deleteTitle": "Delete Pluggy application",
+      "deleteConfirm": "Delete \"{{name}}\"? Its keys are removed from Securo.",
+      "deleteBlocked_one": "It is used by {{count}} connection. Remove that connection first.",
+      "deleteBlocked_other": "It is used by {{count}} connections. Remove those connections first."
     }
   },
   "onboarding": {
@@ -3012,6 +3294,45 @@
       "invoicesHint": "Ako určujeme, ktorá platba vyrovnáva ktorú faktúru.",
       "recurring": "Pravidlá opakovaných",
       "recurringHint": "Ako určujeme, že odpis je účet, ktorý ste už očakávali."
+    }
+  },
+  "installments": {
+    "title": "Installments",
+    "empty": "No installment purchases on this card.",
+    "alerts": "{{conflicts}} parcel(s) out of sequence · {{missing}} parcel(s) the bank did not send",
+    "unnamed": "Installment purchase",
+    "summary": "{{current}}/{{total}} × {{amount}} · total {{total_amount}}",
+    "remaining": "{{amount}} to come",
+    "source": {
+      "manual": "grouped by you",
+      "series": "created in Securo",
+      "detected": "detected"
+    },
+    "merge": "Merge",
+    "mergeInto": "Merge into:",
+    "noMergeTarget": "No compatible purchase (same installments, no repeated parcel).",
+    "confirm": "Confirm",
+    "split": "Own purchase",
+    "undo": "Undo",
+    "moveTo": "Move to purchase…",
+    "manualLink": "linked by you",
+    "pending": "pending",
+    "saved": "Installments updated",
+    "conflictBadge": "Out of sequence: check the installment purchase",
+    "kind": {
+      "posted": "received",
+      "projected": "expected",
+      "missing": "not sent by the bank",
+      "before_history": "before the synced history"
+    },
+    "link": {
+      "auto": "grouped automatically",
+      "conflict": "doesn't fit the purchase",
+      "manual": "grouped by you"
+    },
+    "issue": {
+      "month": "Expected in the bill of {{expected}}",
+      "amount": "Expected about {{expected}}"
     }
   }
 }

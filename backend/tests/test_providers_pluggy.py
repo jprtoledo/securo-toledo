@@ -347,6 +347,33 @@ async def test_get_transactions_follows_cursor_until_next_is_null():
     assert client.get.await_args_list[1].kwargs["params"]["after"] == "CUR2"
 
 
+@pytest.mark.asyncio
+async def test_v2_transactions_sends_only_supported_params():
+    """AC-2.1: /v2/transactions answers 400 "property pageSize should not
+    exist" to page/pageSize; every sweep sends only the cursor filters."""
+    page = MagicMock(raise_for_status=MagicMock())
+    page.json = MagicMock(return_value={"results": [_txn("t1")], "next": None})
+    client = MagicMock()
+    client.get = AsyncMock(return_value=page)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+
+    provider = PluggyProvider()
+    with patch.object(
+        PluggyProvider, "_ensure_api_key", new=AsyncMock(return_value="k")
+    ), patch("app.providers.pluggy.httpx.AsyncClient", return_value=client):
+        await provider.get_transactions({"item_id": "i"}, "acc", None)
+        await provider.get_transactions_filtered(
+            {"item_id": "i"}, "acc", date_from=date(2026, 8, 1),
+            created_at_from="2026-10-01", ids=["t1", "t2"],
+        )
+
+    allowed = {"accountId", "dateFrom", "createdAtFrom", "ids", "after"}
+    for call in client.get.await_args_list:
+        assert set(call.kwargs["params"]) <= allowed
+    assert client.get.await_args_list[0].kwargs["params"] == {"accountId": "acc"}
+
+
 # ----- masked account number (issue #408) -----
 
 

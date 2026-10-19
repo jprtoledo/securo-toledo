@@ -23,9 +23,14 @@ from app.schemas.admin import (
     AdminUserUpdate,
     AppSettingRead,
     AppSettingUpdate,
+    PluggyCredentialCreate,
+    PluggyCredentialRead,
+    PluggyCredentialUpdate,
+    PluggyStatusRead,
     TimezoneSettingRead,
 )
-from app.services import admin_service
+from app.core.secrets_crypto import CredentialsKeyError
+from app.services import admin_service, pluggy_credential_service as pluggy_creds
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -263,3 +268,112 @@ async def check_registration_enabled(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Registration is currently disabled",
         )
+
+
+# --- Pluggy applications (RFC toledo-features, Phase 1) ---------------------
+
+
+def _credential_read(credential, connection_count: int) -> PluggyCredentialRead:
+    return PluggyCredentialRead(
+        id=credential.id,
+        name=credential.name,
+        client_id_hint=credential.client_id_hint,
+        connection_count=connection_count,
+        last_error=credential.last_error,
+        created_at=credential.created_at,
+        updated_at=credential.updated_at,
+    )
+
+
+def _credential_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, pluggy_creds.CredentialNotFound):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if isinstance(exc, pluggy_creds.CredentialNameTaken):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, pluggy_creds.CredentialInUse):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": str(exc), "connection_count": exc.count},
+        )
+    # CredentialError, CredentialsKeyError (missing/invalid key, AC-1.10)
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+_CREDENTIAL_ERRORS = (
+    pluggy_creds.CredentialError,
+    pluggy_creds.CredentialNotFound,
+    pluggy_creds.CredentialInUse,
+    CredentialsKeyError,
+)
+
+
+@router.get("/pluggy-credentials", response_model=list[PluggyCredentialRead])
+async def list_pluggy_credentials(
+    session: AsyncSession = Depends(get_async_session),
+    _user: User = Depends(current_superuser),
+):
+    return [
+        _credential_read(item.credential, item.connection_count)
+        for item in await pluggy_creds.list_credentials(session)
+    ]
+
+
+@router.get("/pluggy-credentials/status", response_model=PluggyStatusRead)
+async def pluggy_credentials_status(
+    session: AsyncSession = Depends(get_async_session),
+    _user: User = Depends(current_superuser),
+):
+    return PluggyStatusRead(**await pluggy_creds.status(session))
+
+
+@router.post(
+    "/pluggy-credentials",
+    response_model=PluggyCredentialRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_pluggy_credential(
+    data: PluggyCredentialCreate,
+    session: AsyncSession = Depends(get_async_session),
+    _user: User = Depends(current_superuser),
+):
+    try:
+        credential = await pluggy_creds.create_credential(
+            session, data.name, data.client_id, data.client_secret
+        )
+    except _CREDENTIAL_ERRORS as exc:
+        raise _credential_http_error(exc)
+    return _credential_read(credential, 0)
+
+
+@router.patch("/pluggy-credentials/{credential_id}", response_model=PluggyCredentialRead)
+async def update_pluggy_credential(
+    credential_id: uuid.UUID,
+    data: PluggyCredentialUpdate,
+    session: AsyncSession = Depends(get_async_session),
+    _user: User = Depends(current_superuser),
+):
+    try:
+        credential = await pluggy_creds.update_credential(
+            session,
+            credential_id,
+            name=data.name,
+            client_id=data.client_id,
+            client_secret=data.client_secret,
+        )
+    except _CREDENTIAL_ERRORS as exc:
+        raise _credential_http_error(exc)
+    counts = await pluggy_creds.connection_counts(session)
+    return _credential_read(credential, counts.get(credential.id, 0))
+
+
+@router.delete("/pluggy-credentials/{credential_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_pluggy_credential(
+    credential_id: uuid.UUID,
+    session: AsyncSession = Depends(get_async_session),
+    _user: User = Depends(current_superuser),
+):
+    try:
+        await pluggy_creds.delete_credential(session, credential_id)
+    except _CREDENTIAL_ERRORS as exc:
+        raise _credential_http_error(exc)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

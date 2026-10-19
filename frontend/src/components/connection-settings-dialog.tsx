@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { connections } from '@/lib/api'
 import { toast } from 'sonner'
 import {
@@ -30,13 +30,21 @@ export function ConnectionSettingsDialog({
   connection,
   supportsAssetSync = false,
 }: ConnectionSettingsDialogProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const queryClient = useQueryClient()
 
   const [displayName, setDisplayName] = useState('')
   const [payeeSource, setPayeeSource] = useState<PayeeSource>('auto')
   const [importPending, setImportPending] = useState(true)
   const [syncAssets, setSyncAssets] = useState(true)
+
+  const isPluggy = open && connection?.provider === 'pluggy'
+  const { data: pluggyCredentials } = useQuery({
+    queryKey: ['pluggy-credentials'],
+    queryFn: connections.pluggyCredentials,
+    enabled: isPluggy,
+  })
+  const pluggyApplication = pluggyCredentials?.find((c) => c.id === connection?.pluggy_credential_id)
 
   const [formSource, setFormSource] = useState<{ connection: typeof connection } | null>(null)
   if (!formSource || formSource.connection !== connection) {
@@ -73,6 +81,29 @@ export function ConnectionSettingsDialog({
           <DialogTitle>{t('connections.settings')}</DialogTitle>
         </DialogHeader>
         <div className="space-y-4">
+          {isPluggy && (
+            <div className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2 text-xs space-y-0.5">
+              <p className="text-muted-foreground">{t('connections.pluggyApplication')}</p>
+              <p className="text-sm font-medium text-foreground">
+                {pluggyApplication?.name ?? t('connections.pluggyApplicationNone')}
+              </p>
+              {connection?.provider_status && (
+                <p className="text-muted-foreground">
+                  {t('connections.providerStatus', {
+                    status: connection.provider_status,
+                    execution: connection.provider_execution_status ?? '—',
+                  })}
+                </p>
+              )}
+              {connection?.consent_expires_at && (
+                <p className="text-muted-foreground">
+                  {t('connections.consentExpires', {
+                    date: new Date(connection.consent_expires_at).toLocaleDateString(i18n.language),
+                  })}
+                </p>
+              )}
+            </div>
+          )}
           <div className="space-y-2">
             <Label htmlFor="connection-display-name">{t('connections.displayName')}</Label>
             <Input

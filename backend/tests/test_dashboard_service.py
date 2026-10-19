@@ -956,7 +956,56 @@ async def test_future_balance_history_carries_pending_into_projected_opening(
         month=next_month, account_ids=[account.id],
     )
 
-    assert history.current[0].balance == 900.0
+    # A future month is all forecast, opening where today's position (the
+    # pending bill included) leaves it.
+    assert history.current[0].balance is None
+    assert history.forecast[0].balance == 900.0
+    assert history.start_balance == 900.0
+    assert history.previous == []
+
+
+@pytest.mark.asyncio
+async def test_balance_history_forecast_continues_across_months(
+    session: AsyncSession, test_user, test_workspace
+):
+    """The evolution is one forecast walk: the next month opens at the
+    forecast close of this one, recurrences included; actual days stop at
+    today and the forecast starts there."""
+    today = date.today()
+    this_month = today.replace(day=1)
+    next_month = (this_month + timedelta(days=32)).replace(day=1)
+    account = Account(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        name="Walk", type="checking", balance=Decimal("0"), currency="BRL",
+    )
+    session.add(account)
+    await session.flush()
+    session.add(Transaction(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        account_id=account.id, description="Opening", amount=Decimal("1000"),
+        currency="BRL", date=this_month, type="credit", source="opening_balance",
+    ))
+    session.add(RecurringTransaction(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id, account_id=account.id,
+        description="Rent", amount=Decimal("300"), currency="BRL", type="debit", frequency="monthly",
+        day_of_month=28, start_date=this_month.replace(day=28), next_occurrence=this_month.replace(day=28),
+        auto_generate=False,
+    ))
+    await session.commit()
+
+    now = await get_balance_history(
+        session, test_workspace.id, test_user.id, month=this_month, account_ids=[account.id],
+    )
+    later = await get_balance_history(
+        session, test_workspace.id, test_user.id, month=next_month, account_ids=[account.id],
+    )
+    assert now.current[today.day - 1].balance == 1000.0
+    assert all(p.balance is None for p in now.current[today.day:])
+    assert now.forecast[today.day - 1].balance == 1000.0
+    assert all(p.balance is None for p in now.forecast[: today.day - 1])
+    assert later.start_balance == now.forecast[-1].balance
+    # Both months' rent are paid by the end of next month.
+    assert later.forecast[-1].balance == 400.0
 
 
 @pytest.mark.asyncio

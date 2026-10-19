@@ -4,7 +4,7 @@ type CategoryReference = {
 }
 
 type RuleReference = {
-  actions: Array<{ op: string; value: string }>
+  actions: Array<{ op: string; value?: string | null }>
 }
 
 export function findCategoryReference<T extends CategoryReference>(

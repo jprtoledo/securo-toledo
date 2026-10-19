@@ -1,5 +1,8 @@
 import type { RuleAction } from '../types'
 
+/** Actions that carry no value. */
+export const VALUELESS_ACTIONS = new Set(['ignore', 'clear_category'])
+
 export function isInvalidDescriptionAction(action: RuleAction): boolean {
   if (action.op !== 'set_description') return false
   const value = String(action.value ?? '').trim()
@@ -18,7 +21,7 @@ export function isInvalidDescriptionAction(action: RuleAction): boolean {
  */
 export function previewableActions(actions: RuleAction[]): RuleAction[] {
   return actions.filter((action) => {
-    if (action.op === 'ignore') return true
+    if (VALUELESS_ACTIONS.has(action.op)) return true
     if (isInvalidDescriptionAction(action)) return false
     return String(action.value ?? '').trim() !== ''
   })

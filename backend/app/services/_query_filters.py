@@ -70,7 +70,7 @@ def counts_in_current_balance(as_of: date):
     )
 
 
-def reporting_date_col(accounting_mode: str):
+def reporting_date_col(accounting_mode: str, *, reference_months: bool = True):
     """The date column a transaction should be *bucketed by* in period
     aggregations (dashboard, reports, budgets).
 
@@ -92,7 +92,39 @@ def reporting_date_col(accounting_mode: str):
         if accounting_mode == "accrual"
         else Transaction.date
     )
+    if reference_months:
+        # Rows recompute resolved (Pluggy accounts, RFC toledo-features §6.2)
+        # carry their reference date: a card row's statement due date, a
+        # bank row's own date. Totals follow the statement month whatever
+        # the global mode, so they agree with the card's own page.
+        base = case(
+            (Transaction.effective_date_source.is_not(None), Transaction.effective_date),
+            else_=base,
+        )
     return func.coalesce(Transaction.effective_bill_date, base)
+
+
+def reporting_date(tx: Transaction, accounting_mode: str) -> date:
+    """Python twin of :func:`reporting_date_col` for loaded rows."""
+    if tx.effective_bill_date is not None:
+        return tx.effective_bill_date
+    if tx.effective_date_source is not None and tx.effective_date is not None:
+        return tx.effective_date
+    return tx.effective_date if accounting_mode == "accrual" else tx.date
+
+
+# Card statement lines that are not spending (RFC §6.5): the bill payment
+# and the previous balance a ledger statement repeats (including the
+# credits it carries over from the previous bill).
+NON_SPENDING_CARD_LINES = ("payment", "previous_balance")
+
+
+def is_card_refund():
+    """SQL filter: a credit on a card statement (refund, reversal, cashback).
+    It lowers the spending of its statement rather than counting as income."""
+    # coalesce: a NULL kind must read as "not a refund", so the negation
+    # callers use stays true instead of becoming NULL.
+    return and_(Transaction.type == "credit", func.coalesce(Transaction.card_line_kind, "") == "credit")
 
 
 def is_not_ignored():
@@ -140,6 +172,8 @@ def counts_as_pnl():
 
     Excludes:
       - paired transfers (both legs were matched; already cancel out),
+      - card statement lines that are not spending: bill payments and the
+        previous balance a ledger statement repeats (RFC toledo-features §6.5),
       - transactions in categories flagged `treat_as_transfer` (one-sided
         movements like investment applications where the counterpart is
         an Asset/Holding, not another Account),
@@ -156,6 +190,10 @@ def counts_as_pnl():
         Transaction.transfer_pair_id.is_(None),
         Transaction.is_ignored.is_(False),
         Transaction.exclude_from_pnl.is_(False),
+        or_(
+            Transaction.card_line_kind.is_(None),
+            Transaction.card_line_kind.not_in(NON_SPENDING_CARD_LINES),
+        ),
         # Settlement *debits* are repayments of debts that were already
         # booked as an expense via the share. Counting them would
         # double-count. Settlement *credits*, however, represent the

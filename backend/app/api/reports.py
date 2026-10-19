@@ -83,6 +83,16 @@ def _resolve_custom_range(
     return start_date, end_date
 
 
+def _window_kwargs(reference_date, past_months, future_months) -> dict:
+    """Window params (reference date with months before and after it), passed
+    only when used; they override the other range params."""
+    if past_months is None and future_months is None:
+        return {}
+    if not (past_months or future_months):
+        raise HTTPException(status_code=422, detail="past_months or future_months must be positive")
+    return {"reference_date": reference_date, "past_months": past_months, "future_months": future_months}
+
+
 @router.get("/net-worth", response_model=ReportResponse)
 async def get_net_worth(
     months: int = Query(12, ge=1, le=24),
@@ -92,12 +102,16 @@ async def get_net_worth(
     period: str | None = Query(None, pattern="^ytd$"),
     start_date: date | None = Query(None),
     end_date: date | None = Query(None),
+    reference_date: date | None = Query(None, description="Window anchor (default today)"),
+    past_months: int | None = Query(None, ge=0, le=24, description="Months before reference_date"),
+    future_months: int | None = Query(None, ge=0, le=24, description="Months after reference_date"),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
     financial_year_start_month = _financial_year_start_month(ctx.workspace.tax_jurisdiction)
-    custom_start, custom_end = _resolve_custom_range(start_date, end_date)
-    effective_period = None if custom_start is not None else period
+    window = _window_kwargs(reference_date, past_months, future_months)
+    custom_start, custom_end = _resolve_custom_range(start_date, end_date) if not window else (None, None)
+    effective_period = None if custom_start is not None or window else period
     _reject_unsupported_fiscal_year_report(
         effective_period, interval, financial_year_start_month
     )
@@ -106,6 +120,7 @@ async def get_net_worth(
         account_ids=account_ids, asset_group_ids=asset_group_ids, period=effective_period,
         financial_year_start_month=financial_year_start_month,
         start_date=custom_start, end_date=custom_end,
+        **window,
     )
 
 
@@ -118,6 +133,9 @@ async def get_income_expenses(
     days: Optional[int] = Query(None, ge=1, le=730),
     start_date: date | None = Query(None),
     end_date: date | None = Query(None),
+    reference_date: date | None = Query(None, description="Window anchor (default today)"),
+    past_months: int | None = Query(None, ge=0, le=24, description="Months before reference_date"),
+    future_months: int | None = Query(None, ge=0, le=24, description="Months after reference_date"),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
@@ -128,8 +146,9 @@ async def get_income_expenses(
     `period`, and `days`. Custom ranges include actuals only, without estimates.
     """
     financial_year_start_month = _financial_year_start_month(ctx.workspace.tax_jurisdiction)
-    custom_start, custom_end = _resolve_custom_range(start_date, end_date)
-    effective_period = None if custom_start is not None else period
+    window = _window_kwargs(reference_date, past_months, future_months)
+    custom_start, custom_end = _resolve_custom_range(start_date, end_date) if not window else (None, None)
+    effective_period = None if custom_start is not None or window else period
     _reject_unsupported_fiscal_year_report(
         effective_period, interval, financial_year_start_month
     )
@@ -138,6 +157,7 @@ async def get_income_expenses(
         account_ids=account_ids, period=effective_period, days=days,
         financial_year_start_month=financial_year_start_month,
         start_date=custom_start, end_date=custom_end,
+        **window,
     )
 
 
@@ -147,10 +167,14 @@ async def get_cash_flow(
     interval: str = Query("daily", pattern="^(daily|weekly|monthly)$"),
     baseline: bool = Query(False),
     account_ids: Optional[list[uuid.UUID]] = Query(None),
+    reference_date: date | None = Query(None, description="Window anchor (default today)"),
+    past_months: int | None = Query(None, ge=0, le=24, description="Months before reference_date"),
+    future_months: int | None = Query(None, ge=0, le=24, description="Months after reference_date"),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
+    window = _window_kwargs(reference_date, past_months, future_months)
     return await report_service.get_cash_flow_report(
         session, ctx.workspace.id, ctx.user_id, months, interval, ctx.user.primary_currency,
-        baseline=baseline, account_ids=account_ids,
+        baseline=baseline, account_ids=account_ids, **window,
     )

@@ -55,8 +55,11 @@ class DailyBalance(BaseModel):
 
 
 class BalanceHistory(BaseModel):
-    current: list[DailyBalance]
-    previous: list[DailyBalance]
+    # Money in the accounts (cards leave on each bill's due date).
+    current: list[DailyBalance]  # actual, up to today
+    previous: list[DailyBalance]  # the month before; empty for a future month
+    forecast: list[DailyBalance] = []  # from today on
+    start_balance: Optional[float] = None  # end of the day before the month
 
 
 class ProjectedTransaction(BaseModel):
